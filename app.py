@@ -9,6 +9,18 @@ import streamlit as st
 st.set_page_config(page_title="Sistema de Conciliación", layout="wide")
 
 # ==========================================
+# FUNCIÓN AUXILIAR: BUSCAR COLUMNA FLEXIBLE
+# ==========================================
+def obtener_valor_columna(row, posibles_nombres, valor_defecto=""):
+    """Busca en la fila el valor de la primera columna que coincida con la lista de nombres."""
+    for col in row.index:
+        for nombre in posibles_nombres:
+            if nombre.lower() in str(col).lower().strip():
+                val = row[col]
+                return val if pd.notnull(val) else valor_defecto
+    return valor_defecto
+
+# ==========================================
 # 1. FUNCIÓN QUE GENERA EL EXCEL CONCILIADO
 # ==========================================
 def generar_excel_conciliado_con_datos(df_aux, df_ext, buffer):
@@ -85,12 +97,24 @@ def generar_excel_conciliado_con_datos(df_aux, df_ext, buffer):
 
     for idx, row in df_aux.iterrows():
         r = idx + 2
+        
+        fecha = str(obtener_valor_columna(row, ['fecha', 'fec'], ''))
+        doc = str(obtener_valor_columna(row, ['documento', 'doc', 'comprobante', 'num'], ''))
+        concepto = str(obtener_valor_columna(row, ['concepto', 'detalle', 'descripcion'], ''))
+        nombre = str(obtener_valor_columna(row, ['nombre', 'tercero', 'beneficiario', 'razon'], ''))
+        
+        monto_raw = obtener_valor_columna(row, ['egreso', 'valor', 'monto', 'debito', 'retiro', 'importe'], 0)
+        try:
+            monto = float(str(monto_raw).replace('$', '').replace(',', '').strip())
+        except ValueError:
+            monto = 0.0
+
         ws_aux.append([
-            str(row.get('Fecha', '')),
-            str(row.get('Documento', '')),
-            str(row.get('Concepto/Detalle', '')),
-            str(row.get('NOMBRE', '')),
-            float(row.get('Egresos (-)', 0)) if pd.notnull(row.get('Egresos (-)')) else 0,
+            fecha,
+            doc,
+            concepto,
+            nombre,
+            monto,
             f'=CONCATENATE(A{r},E{r},"-",COUNTIFS($A$2:A{r},A{r},$E$2:E{r},E{r}))',
             f'=_xlfn.XLOOKUP(F{r}, \'Extracto Bancario\'!$D:$D, \'Extracto Bancario\'!$B:$B, "NO ESTA EN BANCOS", 0)'
         ])
@@ -107,10 +131,20 @@ def generar_excel_conciliado_con_datos(df_aux, df_ext, buffer):
 
     for idx, row in df_ext.iterrows():
         r = idx + 2
+        
+        fecha_e = str(obtener_valor_columna(row, ['fecha', 'fec'], ''))
+        ref_e = str(obtener_valor_columna(row, ['referencia', 'ref', 'concepto', 'descripcion', 'detalle'], ''))
+        
+        monto_e_raw = obtener_valor_columna(row, ['retiro', 'valor', 'monto', 'egreso', 'debito', 'importe'], 0)
+        try:
+            monto_e = float(str(monto_e_raw).replace('$', '').replace(',', '').strip())
+        except ValueError:
+            monto_e = 0.0
+
         ws_ext.append([
-            str(row.get('Fecha', '')),
-            str(row.get('Referencia', '')),
-            float(row.get('Retiros ()', 0)) if pd.notnull(row.get('Retiros ()')) else 0,
+            fecha_e,
+            ref_e,
+            monto_e,
             f'=CONCATENATE(A{r},C{r},"-",COUNTIFS($A$2:A{r},A{r},$C$2:C{r},C{r}))',
             f'=_xlfn.XLOOKUP(D{r}, \'Auxiliar Contable\'!$F:$F, \'Auxiliar Contable\'!$B:$B, "Pen Contabilidad", 0)',
             "", ""
@@ -150,7 +184,7 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
 
     if archivo_mov is not None and archivo_aux is not None:
         try:
-            # Reintentos de codificación para archivos CSV con tildes/eñes
+            # Reintentos de codificación
             try:
                 df_mov_data = pd.read_csv(archivo_mov, encoding='utf-8')
             except UnicodeDecodeError:
@@ -164,6 +198,16 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
             df_aux_data = pd.read_excel(archivo_aux)
 
             st.success("✅ Archivos leídos exitosamente.")
+
+            # Mostrar vista previa de lo que se leyó
+            st.write("### 👁️ Vista previa de los datos leídos")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write("**Movimiento Diario (CSV):**")
+                st.dataframe(df_mov_data.head(3))
+            with c2:
+                st.write("**Auxiliar Contable (Excel):**")
+                st.dataframe(df_aux_data.head(3))
 
             excel_resultado = io.BytesIO()
             generar_excel_conciliado_con_datos(df_aux_data, df_mov_data, excel_resultado)
