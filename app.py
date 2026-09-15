@@ -5,16 +5,16 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 import pandas as pd
 import streamlit as st
 
-# Configuración de la página web
+# Configuración de la página
 st.set_page_config(page_title="Sistema de Conciliación & Control Diario", layout="wide")
 
 # ==========================================
-# 1. FUNCIÓN PARA GENERAR PLANTILLA EXCEL
+# 1. FUNCIÓN PARA GENERAR EXCEL SIN #REF!
 # ==========================================
 def generar_excel_plantilla(df_aux_proc, df_ext_proc, buffer, tipo_reporte="General"):
     wb = openpyxl.Workbook()
 
-    # --- 1. HOJA: Resumen Conciliación ---
+    # --- HOJA 1: Resumen Conciliación ---
     ws_resumen = wb.active
     ws_resumen.title = "Resumen Conciliación"
     ws_resumen.views.sheetView[0].showGridLines = True
@@ -49,12 +49,16 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, buffer, tipo_reporte="Gene
         cell = ws_resumen.cell(row=8, column=col_idx, value=text)
         cell.font, cell.fill, cell.alignment = font_header, fill_header, Alignment(horizontal="center", vertical="center")
 
+    max_aux = len(df_aux_proc) + 1
+    max_ext = len(df_ext_proc) + 1
+
+    # Fórmulas directas por coordenadas de celda (evita errores #REF!)
     filas = [
-        ("Saldo Mov según Auxiliar Contable", "=+Tabla1[[#Totals],[Monto (+/-)]]", None),
-        ("(+) Partidas No registradas por el Banco", '=SUMIF(Tabla1[Extracto],"NO ESTA EN BANCOS",Tabla1[Monto (+/-)])', "Movimientos en libros pendientes en extracto"),
+        ("Saldo Mov según Auxiliar Contable", f"=SUM('Auxiliar Contable'!E2:E{max(max_aux, 2)})", None),
+        ("(+) Partidas No registradas por el Banco", f'=SUMIF(\'Auxiliar Contable\'!G2:G{max(max_aux, 2)}, "NO ESTA EN BANCOS", \'Auxiliar Contable\'!E2:E{max(max_aux, 2)})', "Movimientos en libros pendientes en extracto"),
         ("SALDO CONTABLE AJUSTADO", "=B9-B10", "Saldo conciliado contable"),
-        ("Saldo Final según Extracto Bancario", "=+Tabla2[[#Totals],[Monto (+/-)]]", None),
-        ("(-) Partidas no Contabilizadas", '=SUMIF(Tabla2[Contabilidad],"Pen Contabilidad",Tabla2[Monto (+/-)])', "Movimientos del banco faltantes en contabilidad"),
+        ("Saldo Final según Extracto Bancario", f"=SUM('Extracto Bancario'!C2:C{max(max_ext, 2)})", None),
+        ("(-) Partidas no Contabilizadas", f'=SUMIF(\'Extracto Bancario\'!E2:E{max(max_ext, 2)}, "Pen Contabilidad", \'Extracto Bancario\'!C2:C{max(max_ext, 2)})', "Movimientos del banco faltantes en contabilidad"),
         ("SALDO BANCARIO AJUSTADO", "=+B12-B13", "Saldo conciliado bancario"),
         ("DIFERENCIA FINAL POR CONCILIAR", "=+B12-B9", "Diferencia por conciliar")
     ]
@@ -78,10 +82,10 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, buffer, tipo_reporte="Gene
     ws_resumen.column_dimensions['B'].width = 25
     ws_resumen.column_dimensions['C'].width = 45
 
-    # --- 2. HOJA: Auxiliar Contable ---
+    # --- HOJA 2: Auxiliar Contable ---
     ws_aux = wb.create_sheet(title="Auxiliar Contable")
     ws_aux.views.sheetView[0].showGridLines = True
-    ws_aux.append(["Fecha", "Documento", "Concepto/Detalle", "NOMBRE", "Naturaleza", "Monto (+/-)", "LLAVE", "Extracto"])
+    ws_aux.append(["Fecha", "Documento", "Concepto/Detalle", "NOMBRE", "Monto (+/-)", "LLAVE", "Extracto"])
 
     for idx, row in df_aux_proc.reset_index(drop=True).iterrows():
         r = idx + 2
@@ -89,7 +93,6 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, buffer, tipo_reporte="Gene
         doc_val = row.get('Comprobante', '')
         concepto_val = row.get('Concepto', row.get('Código contable', ''))
         nombre_val = row.get('Nombre del tercero', '')
-        tipo_val = row.get('Naturaleza', 'General')
         monto_val = float(row.get('Monto_Neto', 0))
 
         ws_aux.append([
@@ -97,47 +100,44 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, buffer, tipo_reporte="Gene
             str(doc_val),
             str(concepto_val),
             str(nombre_val),
-            str(tipo_val),
             monto_val,
-            f'=CONCATENATE(A{r},F{r},"-",COUNTIFS($A$2:A{r},A{r},$F$2:F{r},F{r}))',
-            f'=IFISNA(VLOOKUP(G{r}, \'Extracto Bancario\'!$D:$B, 1, FALSE), "NO ESTA EN BANCOS")'
+            f'=CONCATENATE(A{r},E{r},"-",COUNTIFS($A$2:A{r},A{r},$E$2:E{r},E{r}))',
+            f'=IF(ISNUMBER(MATCH(F{r}, \'Extracto Bancario\'!$D:$D, 0)), "CONCILIADO", "NO ESTA EN BANCOS")'
         ])
 
-    max_aux = max(ws_aux.max_row, 2)
-    tab1 = Table(displayName="Tabla1", ref=f"A1:H{max_aux}")
+    max_aux_tbl = max(ws_aux.max_row, 2)
+    tab1 = Table(displayName="Tabla1", ref=f"A1:G{max_aux_tbl}")
     tab1.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
     ws_aux.add_table(tab1)
 
-    # --- 3. HOJA: Extracto Bancario ---
+    # --- HOJA 3: Extracto Bancario ---
     ws_ext = wb.create_sheet(title="Extracto Bancario")
     ws_ext.views.sheetView[0].showGridLines = True
-    ws_ext.append(["Fecha", "Referencia", "Naturaleza", "LLAVE", "Contabilidad"])
+    ws_ext.append(["Fecha", "Referencia", "Monto (+/-)", "LLAVE", "Contabilidad"])
 
     for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
         r = idx + 2
         fecha_val = row.get('Fecha_Clean', row.get('FECHA', ''))
         ref_val = row.get('Descripcion', row.get('DESCRIPCIÓN', ''))
-        tipo_val = row.get('Naturaleza', 'General')
         monto_val = float(row.get('Monto_Neto', 0))
 
         ws_ext.append([
             str(fecha_val),
             str(ref_val),
-            str(tipo_val),
             monto_val,
-            f'=CONCATENATE(A{r},D{r},"-",COUNTIFS($A$2:A{r},A{r},$D$2:D{r},D{r}))',
-            f'=IFISNA(VLOOKUP(E{r}, \'Auxiliar Contable\'!$G:$B, 1, FALSE), "Pen Contabilidad")'
+            f'=CONCATENATE(A{r},C{r},"-",COUNTIFS($A$2:A{r},A{r},$C$2:C{r},C{r}))',
+            f'=IF(ISNUMBER(MATCH(D{r}, \'Auxiliar Contable\'!$F:$F, 0)), "CONCILIADO", "Pen Contabilidad")'
         ])
 
-    max_ext = max(ws_ext.max_row, 2)
-    tab2 = Table(displayName="Tabla2", ref=f"A1:E{max_ext}")
+    max_ext_tbl = max(ws_ext.max_row, 2)
+    tab2 = Table(displayName="Tabla2", ref=f"A1:E{max_ext_tbl}")
     tab2.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
     ws_ext.add_table(tab2)
 
     wb.save(buffer)
 
 # ==========================================
-# 2. FUNCIONES DE PROCESAMIENTO Y LIMPIEZA
+# 2. FUNCIONES DE PROCESAMIENTO
 # ==========================================
 def limpiar_valor(val):
     if pd.isna(val):
@@ -160,22 +160,16 @@ def procesar_auxiliar(df_raw):
     
     df['Débito_Clean'] = df['Débito'].apply(limpiar_valor)
     df['Crédito_Clean'] = df['Crédito'].apply(limpiar_valor)
-    
-    # Calcular Neto y Naturaleza
     df['Monto_Neto'] = df['Débito_Clean'] - df['Crédito_Clean']
-    df['Monto_Abs'] = df['Monto_Neto'].abs().round(2)
-    df['Naturaleza'] = df['Monto_Neto'].apply(lambda x: "Ingreso" if x > 0 else "Egreso")
     
-    df['Fecha_Clean'] = pd.to_datetime(df['Fecha elaboration' if 'Fecha elaboration' in df.columns else 'Fecha elaboración'], format='%d/%m/%Y', errors='coerce').dt.strftime('%Y-%m-%d')
+    col_fecha = 'Fecha elaboration' if 'Fecha elaboration' in df.columns else 'Fecha elaboración'
+    df['Fecha_Clean'] = pd.to_datetime(df[col_fecha], format='%d/%m/%Y', errors='coerce').dt.strftime('%Y-%m-%d')
     return df
 
 def procesar_diario_csv(df_raw):
     df = df_raw.iloc[:, [0, 1, 3, 5, 6, 7]].copy()
     df.columns = ['Cuenta', 'Oficina', 'Fecha_Int', 'Valor_Raw', 'Codigo_Tx', 'Descripcion']
-    
     df['Monto_Neto'] = df['Valor_Raw'].apply(limpiar_valor)
-    df['Monto_Abs'] = df['Monto_Neto'].abs().round(2)
-    df['Naturaleza'] = df['Monto_Neto'].apply(lambda x: "Ingreso" if x > 0 else "Egreso")
     df['Fecha_Clean'] = pd.to_datetime(df['Fecha_Int'].astype(str), format='%Y%m%d', errors='coerce').dt.strftime('%Y-%m-%d')
     return df
 
@@ -184,14 +178,11 @@ def procesar_extracto_excel(df_raw):
     df.columns = ['FECHA', 'DESCRIPCIÓN', 'SUCURSAL', 'DCTO', 'VALOR', 'SALDO', 'X1', 'X2']
     df = df.dropna(subset=['FECHA', 'VALOR'])
     df = df[~df['FECHA'].astype(str).str.contains('FECHA|FIN ESTADO', case=False, na=False)]
-    
     df['Monto_Neto'] = df['VALOR'].apply(limpiar_valor)
-    df['Monto_Abs'] = df['Monto_Neto'].abs().round(2)
-    df['Naturaleza'] = df['Monto_Neto'].apply(lambda x: "Ingreso" if x > 0 else "Egreso")
     return df
 
 # ==========================================
-# 3. MENÚ LATERAL Y MÓDULOS
+# 3. INTERFAZ Y NAVEGACIÓN
 # ==========================================
 st.sidebar.title("📌 Menú Principal")
 opcion = st.sidebar.radio(
@@ -201,7 +192,6 @@ opcion = st.sidebar.radio(
 
 if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
     st.title("📖 Cruce Operativo Diario")
-    st.write("Carga el movimiento diario registrado en **CSV** y el **Auxiliar Contable**.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -216,40 +206,28 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
         df_diario = procesar_diario_csv(df_diario_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        st.success("✅ Datos procesados con éxito.")
+        st.success("✅ Archivos procesados con éxito.")
 
-        st.markdown("### 📥 Descargas Disponibles")
-        c_desc1, c_desc2, c_desc3 = st.columns(3)
+        st.markdown("### 📥 Generar y Descargar Archivos")
+        c1, c2, c3 = st.columns(3)
 
-        # 1. Descarga Egresos
-        with c_desc1:
+        with c1:
             buf_egr = io.BytesIO()
-            df_a_egr = df_aux[df_aux['Naturaleza'] == 'Egreso']
-            df_d_egr = df_diario[df_diario['Naturaleza'] == 'Egreso']
-            generar_excel_plantilla(df_a_egr, df_d_egr, buf_egr, tipo_reporte="Egresos")
-            st.download_button("🔻 Descargar EGRESOS (.xlsx)", data=buf_egr.getvalue(), file_name="Egresos_Diario.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            generar_excel_plantilla(df_aux[df_aux['Monto_Neto'] < 0], df_diario[df_diario['Monto_Neto'] < 0], buf_egr, "Egresos")
+            st.download_button("🔻 Descargar EGRESOS (-)", data=buf_egr.getvalue(), file_name="Egresos_Diarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # 2. Descarga Ingresos
-        with c_desc2:
+        with c2:
             buf_ing = io.BytesIO()
-            df_a_ing = df_aux[df_aux['Naturaleza'] == 'Ingreso']
-            df_d_ing = df_diario[df_diario['Naturaleza'] == 'Ingreso']
-            generar_excel_plantilla(df_a_ing, df_d_ing, buf_ing, tipo_reporte="Ingresos")
-            st.download_button("🟢 Descargar INGRESOS (.xlsx)", data=buf_ing.getvalue(), file_name="Ingresos_Diario.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            generar_excel_plantilla(df_aux[df_aux['Monto_Neto'] > 0], df_diario[df_diario['Monto_Neto'] > 0], buf_ing, "Ingresos")
+            st.download_button("🟢 Descargar INGRESOS (+)", data=buf_ing.getvalue(), file_name="Ingresos_Diarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # 3. Descarga General
-        with c_desc3:
+        with c3:
             buf_gen = io.BytesIO()
-            generar_excel_plantilla(df_aux, df_diario, buf_gen, tipo_reporte="General_Consolidado")
-            st.download_button("📦 Descargar GENERAL (.xlsx)", data=buf_gen.getvalue(), file_name="General_Diario.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        st.markdown("---")
-        st.write("### 👁️ Vista Previa Consolidada")
-        st.dataframe(df_aux[['Fecha_Clean', 'Comprobante', 'Nombre del tercero', 'Monto_Neto', 'Naturaleza']].head(10))
+            generar_excel_plantilla(df_aux, df_diario, buf_gen, "General_Consolidado")
+            st.download_button("📦 Descargar GENERAL", data=buf_gen.getvalue(), file_name="General_Diarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
     st.title("📊 Conciliación Bancaria Mensual")
-    st.write("Carga el **Extracto Bancario (.xlsx)** y el **Auxiliar Contable (.xlsx)**.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -266,28 +244,20 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
 
         st.success("✅ Conciliación calculada correctamente.")
 
-        st.markdown("### 📥 Descargas Disponibles")
-        c_desc1, c_desc2, c_desc3 = st.columns(3)
+        st.markdown("### 📥 Generar y Descargar Archivos")
+        c1, c2, c3 = st.columns(3)
 
-        with c_desc1:
+        with c1:
             buf_egr_m = io.BytesIO()
-            df_a_egr = df_aux[df_aux['Naturaleza'] == 'Egreso']
-            df_e_egr = df_ext[df_ext['Naturaleza'] == 'Egreso']
-            generar_excel_plantilla(df_a_egr, df_e_egr, buf_egr_m, tipo_reporte="Egresos")
-            st.download_button("🔻 Descargar EGRESOS (.xlsx)", data=buf_egr_m.getvalue(), file_name="Conciliacion_Egresos_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            generar_excel_plantilla(df_aux[df_aux['Monto_Neto'] < 0], df_ext[df_ext['Monto_Neto'] < 0], buf_egr_m, "Egresos")
+            st.download_button("🔻 Descargar EGRESOS (-)", data=buf_egr_m.getvalue(), file_name="Conciliacion_Egresos_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        with c_desc2:
+        with c2:
             buf_ing_m = io.BytesIO()
-            df_a_ing = df_aux[df_aux['Naturaleza'] == 'Ingreso']
-            df_e_ing = df_ext[df_ext['Naturaleza'] == 'Ingreso']
-            generar_excel_plantilla(df_a_ing, df_e_ing, buf_ing_m, tipo_reporte="Ingresos")
-            st.download_button("🟢 Descargar INGRESOS (.xlsx)", data=buf_ing_m.getvalue(), file_name="Conciliacion_Ingresos_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            generar_excel_plantilla(df_aux[df_aux['Monto_Neto'] > 0], df_ext[df_ext['Monto_Neto'] > 0], buf_ing_m, "Ingresos")
+            st.download_button("🟢 Descargar INGRESOS (+)", data=buf_ing_m.getvalue(), file_name="Conciliacion_Ingresos_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        with c_desc3:
+        with c3:
             buf_gen_m = io.BytesIO()
-            generar_excel_plantilla(df_aux, df_ext, buf_gen_m, tipo_reporte="General_Consolidado")
-            st.download_button("📦 Descargar GENERAL (.xlsx)", data=buf_gen_m.getvalue(), file_name="Conciliacion_General_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        st.markdown("---")
-        st.write("### 👁️ Vista Previa Extracto Procesado")
-        st.dataframe(df_ext[['FECHA', 'DESCRIPCIÓN', 'VALOR', 'Naturaleza']].head(10))
+            generar_excel_plantilla(df_aux, df_ext, buf_gen_m, "General_Consolidado")
+            st.download_button("📦 Descargar GENERAL", data=buf_gen_m.getvalue(), file_name="Conciliacion_General_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
