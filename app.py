@@ -1,18 +1,21 @@
+import io
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
+import pandas as pd
+import streamlit as st
 
-def generar_excel_conciliacion(nombre_archivo="Conciliacion_Egresos_CtaCte.xlsx"):
+# ==========================================
+# 1. FUNCIÓN QUE CREA EL EXCEL EN MEMORIA
+# ==========================================
+def generar_excel_conciliacion(output_buffer):
     wb = openpyxl.Workbook()
 
-    # -------------------------------------------------------------
-    # 1. HOJA: Resumen Conciliación
-    # -------------------------------------------------------------
+    # --- HOJA 1: Resumen Conciliación ---
     ws_resumen = wb.active
     ws_resumen.title = "Resumen Conciliación"
     ws_resumen.views.sheetView[0].showGridLines = True
 
-    # Estilos
     font_title = Font(name="Calibri", size=14, bold=True, color="1F497D")
     font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     font_bold = Font(name="Calibri", size=11, bold=True)
@@ -27,7 +30,6 @@ def generar_excel_conciliacion(nombre_archivo="Conciliacion_Egresos_CtaCte.xlsx"
         top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9')
     )
 
-    # Encabezados
     ws_resumen['A2'] = "CONCILIACIÓN BANCARIA AUTOMATIZADA"
     ws_resumen['A2'].font = font_title
     ws_resumen['B2'] = "Egresos"
@@ -44,7 +46,6 @@ def generar_excel_conciliacion(nombre_archivo="Conciliacion_Egresos_CtaCte.xlsx"
         cell = ws_resumen.cell(row=8, column=col_idx, value=text)
         cell.font, cell.fill, cell.alignment = font_header, fill_header, Alignment(horizontal="center", vertical="center")
 
-    # Filas con Fórmulas Estructuradas
     filas = [
         ("Saldo Mov según Auxiliar Contable", "=+Tabla1[[#Totals],[Egresos (-)]]", None),
         ("(+) Egresos No registrados por el Banco", '=SUMIF(Tabla1[Extracto],"NO ESTA EN BANCOS",Tabla1[Egresos (-)])', "Ingresos/Egresos en libros pendientes en extracto"),
@@ -66,22 +67,21 @@ def generar_excel_conciliacion(nombre_archivo="Conciliacion_Egresos_CtaCte.xlsx"
             cell.font = font_regular
 
         if r_idx in (11, 14):
-            for cell in (c1, c2, c3): cell.fill, cell.font = fill_subtotal, font_bold
+            for cell in (c1, c2, c3): 
+                cell.fill, cell.font = fill_subtotal, font_bold
         elif r_idx == 15:
-            for cell in (c1, c2, c3): cell.fill, cell.font = fill_highlight, font_bold
+            for cell in (c1, c2, c3): 
+                cell.fill, cell.font = fill_highlight, font_bold
 
     ws_resumen.column_dimensions['A'].width = 42
     ws_resumen.column_dimensions['B'].width = 25
     ws_resumen.column_dimensions['C'].width = 45
 
-    # -------------------------------------------------------------
-    # 2. HOJA: Auxiliar Contable
-    # -------------------------------------------------------------
+    # --- HOJA 2: Auxiliar Contable ---
     ws_aux = wb.create_sheet(title="Auxiliar Contable")
     ws_aux.views.sheetView[0].showGridLines = True
     ws_aux.append(["Fecha", "Documento", "Concepto/Detalle", "NOMBRE", "Egresos (-)", "LLAVE", "Extracto"])
 
-    # Fila de ejemplo
     ws_aux.append([
         "2026-08-03", "RP-1-2489", "900633796", "CALIDAD COLOMBIA SERVICES SAS", 1590061,
         '=CONCATENATE(A2,E2,"-",COUNTIFS($A$2:A2,A2,$E$2:E2,E2))',
@@ -92,14 +92,11 @@ def generar_excel_conciliacion(nombre_archivo="Conciliacion_Egresos_CtaCte.xlsx"
     tab1.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
     ws_aux.add_table(tab1)
 
-    # -------------------------------------------------------------
-    # 3. HOJA: Extracto Bancario
-    # -------------------------------------------------------------
+    # --- HOJA 3: Extracto Bancario ---
     ws_ext = wb.create_sheet(title="Extracto Bancario")
     ws_ext.views.sheetView[0].showGridLines = True
     ws_ext.append(["Fecha", "Referencia", "Retiros ()", "LLAVE", "Contabilidad", "Columna1", "Columna2"])
 
-    # Fila de ejemplo
     ws_ext.append([
         "2026-08-03", " PAGO A PROVE CALIDAD COLOMBI", 1590061,
         '=CONCATENATE(A2,C2,"-",COUNTIFS($A$2:A2,A2,$C$2:C2,C2))',
@@ -111,7 +108,28 @@ def generar_excel_conciliacion(nombre_archivo="Conciliacion_Egresos_CtaCte.xlsx"
     tab2.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
     ws_ext.add_table(tab2)
 
-    wb.save(nombre_archivo)
-    return nombre_archivo
+    # GUARDAR EN MEMORIA (No en disco duro)
+    wb.save(output_buffer)
 
-generar_excel_conciliacion()
+
+# ==========================================
+# 2. INTERFAZ DE STREAMLIT
+# ==========================================
+st.set_page_config(page_title="Sistema de Conciliación", layout="wide")
+
+st.title("🏦 Sistema Automatizado de Conciliación Bancaria")
+
+# Generar el archivo en la RAM
+buffer_excel = io.BytesIO()
+generar_excel_conciliacion(buffer_excel)
+
+# Crear el botón en la barra lateral para descargar
+st.sidebar.header("Opciones de Descarga")
+st.sidebar.download_button(
+    label="📥 Descargar Plantilla en Excel",
+    data=buffer_excel.getvalue(),
+    file_name="Conciliacion_Egresos_CtaCte.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+st.info("Utiliza el botón en la barra lateral izquierda para descargar el modelo en Excel.")
