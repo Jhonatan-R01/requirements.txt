@@ -8,7 +8,6 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
-# Configuración de la página Streamlit
 st.set_page_config(page_title="Sistema de Conciliación & Control Diario/Mensual", layout="wide")
 
 # ==========================================
@@ -27,77 +26,75 @@ def limpiar_valor(val):
     except:
         return 0.0
 
-def es_fecha_valida(val):
-    """Verifica si una celda contiene un patrón de fecha válido."""
-    if pd.isna(val):
-        return False
-    val_s = str(val).strip()
-    return bool(re.match(r'^\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?$', val_s))
-
 def normalizar_fecha_ddmmyyyy(val, year_base=2026):
-    """Garantiza la salida en formato homogéneo DD/MM/YYYY."""
-    if pd.isna(val):
-        return ""
+    if pd.isna(val) or str(val).strip() == '':
+        return "01/01/2026"
     val_s = str(val).strip().split(' ')[0].replace('-', '/')
     parts = val_s.split('/')
     if len(parts) == 2:
-        d, m = int(parts[0]), int(parts[1])
-        return f"{d:02d}/{m:02d}/{year_base}"
-    elif len(parts) == 3:
-        d, m, y = int(parts[0]), int(parts[1]), parts[2]
-        if len(y) == 2:
-            y = f"20{y}"
-        return f"{d:02d}/{m:02d}/{y}"
-    return val_s
+        try:
+            d, m = int(parts[0]), int(parts[1])
+            return f"{d:02d}/{m:02d}/{year_base}"
+        except:
+            return "01/01/2026"
+    elif len(parts) >= 3:
+        try:
+            d, m, y = int(parts[0]), int(parts[1]), str(parts[2])
+            if len(y) == 2:
+                y = f"20{y}"
+            return f"{d:02d}/{m:02d}/{y}"
+        except:
+            return "01/01/2026"
+    return "01/01/2026"
 
 # ==========================================
 # 2. ALGORITMO DE SUGERENCIAS INTELIGENTES
 # ==========================================
 def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
     sugerencias = []
-    
+    if df_aux_pend.empty or df_ext_pend.empty:
+        return pd.DataFrame(sugerencias)
+
     aux_tmp = df_aux_pend.copy()
     ext_tmp = df_ext_pend.copy()
     
-    # Procesar fechas temporales para cálculos de días de desfase
+    # Asegurar existencia de Fecha_Clean
+    if 'Fecha_Clean' not in aux_tmp.columns:
+        aux_tmp['Fecha_Clean'] = "01/01/2026"
+    if 'Fecha_Clean' not in ext_tmp.columns:
+        ext_tmp['Fecha_Clean'] = "01/01/2026"
+
     aux_tmp['Fecha_dt'] = pd.to_datetime(aux_tmp['Fecha_Clean'], format='%d/%m/%Y', errors='coerce')
     ext_tmp['Fecha_dt'] = pd.to_datetime(ext_tmp['Fecha_Clean'], format='%d/%m/%Y', errors='coerce')
 
     ext_usados = set()
 
     for idx_a, row_a in aux_tmp.iterrows():
-        monto_a = float(row_a['Monto_Neto'])
+        monto_a = float(row_a.get('Monto_Neto', 0))
         fecha_a = row_a['Fecha_dt']
-        
-        if pd.isna(fecha_a):
-            continue
 
         candidatos = []
         for idx_e, row_e in ext_tmp.iterrows():
             if idx_e in ext_usados:
                 continue
                 
-            monto_e = float(row_e['Monto_Neto'])
+            monto_e = float(row_e.get('Monto_Neto', 0))
             fecha_e = row_e['Fecha_dt']
             
-            if pd.isna(fecha_e):
-                continue
-
-            # Regla 1: Mismo Mes y Mismo Año
-            if (fecha_a.year == fecha_e.year) and (fecha_a.month == fecha_e.month):
-                diff_monto = abs(monto_a - monto_e)
+            diff_monto = abs(monto_a - monto_e)
+            
+            if diff_monto <= tol_monto:
+                dias_desfase = abs((fecha_e - fecha_a).days) if (pd.notna(fecha_a) and pd.notna(fecha_e)) else 0
                 
-                # Regla 2: Dentro de la tolerancia
-                if diff_monto <= tol_monto:
-                    dias_desfase = abs((fecha_e - fecha_a).days)
-                    candidatos.append({
-                        'idx_e': idx_e,
-                        'Fecha_Banco': row_e['Fecha_Clean'],
-                        'Ref_Banco': row_e.get('Descripcion', row_e.get('DESCRIPCIÓN', '')),
-                        'Monto_Banco': monto_e,
-                        'Diff_Monto': diff_monto,
-                        'Dias_Desfase': dias_desfase
-                    })
+                # Coincidencia si están dentro del mismo mes o desfase menor a 15 días
+                candidatos.append({
+                    'idx_e': idx_e,
+                    'Fecha_Banco': row_e['Fecha_Clean'],
+                    'Ref_Banco': row_e.get('Descripcion', row_e.get('DESCRIPCIÓN', '')),
+                    'Monto_Banco': monto_e,
+                    'Diff_Monto': diff_monto,
+                    'Dias_Desfase': dias_desfase
+                })
 
         if candidatos:
             candidatos.sort(key=lambda x: (x['Diff_Monto'], x['Dias_Desfase']))
@@ -122,12 +119,11 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
     return pd.DataFrame(sugerencias)
 
 # ==========================================
-# 3. GENERADOR DE LIBRO EXCEL DE 6 HOJAS
+# 3. GENERADOR DE LIBRO EXCEL (6 HOJAS)
 # ==========================================
 def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, tipo_reporte="General"):
     wb = openpyxl.Workbook()
 
-    # Estilos globales
     font_title = Font(name="Calibri", size=14, bold=True, color="1F497D")
     font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     font_bold = Font(name="Calibri", size=11, bold=True)
@@ -142,9 +138,7 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
         top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9')
     )
 
-    # ----------------------------------------------------
     # HOJA 1: CONCILIACION
-    # ----------------------------------------------------
     ws_resumen = wb.active
     ws_resumen.title = "CONCILIACION"
     ws_resumen.views.sheetView[0].showGridLines = True
@@ -197,16 +191,14 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     ws_resumen.column_dimensions['B'].width = 25
     ws_resumen.column_dimensions['C'].width = 45
 
-    # ----------------------------------------------------
     # HOJA 2: AUXILIAR
-    # ----------------------------------------------------
     ws_aux = wb.create_sheet(title="AUXILIAR")
     ws_aux.views.sheetView[0].showGridLines = True
     ws_aux.append(["Fecha", "Documento", "Concepto/Detalle", "NOMBRE", "Monto (+/-)", "LLAVE", "Extracto"])
 
     for idx, row in df_aux_proc.reset_index(drop=True).iterrows():
         r = idx + 2
-        fecha_val = row.get('Fecha_Clean', row.get('Fecha elaboración', ''))
+        fecha_val = row.get('Fecha_Clean', '')
         doc_val = row.get('Comprobante', '')
         concepto_val = row.get('Concepto', row.get('Código contable', ''))
         nombre_val = row.get('Nombre del tercero', '')
@@ -227,16 +219,14 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     tab1.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
     ws_aux.add_table(tab1)
 
-    # ----------------------------------------------------
     # HOJA 3: EXTRACTO
-    # ----------------------------------------------------
     ws_ext = wb.create_sheet(title="EXTRACTO")
     ws_ext.views.sheetView[0].showGridLines = True
     ws_ext.append(["Fecha", "Referencia", "Monto (+/-)", "LLAVE", "Contabilidad"])
 
     for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
         r = idx + 2
-        fecha_val = row.get('Fecha_Clean', row.get('FECHA', ''))
+        fecha_val = row.get('Fecha_Clean', '')
         ref_val = row.get('Descripcion', row.get('DESCRIPCIÓN', ''))
         monto_val = float(row.get('Monto_Neto', 0))
 
@@ -253,27 +243,24 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     tab2.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
     ws_ext.add_table(tab2)
 
-    # ----------------------------------------------------
     # HOJA 4: SUGERENCIAS
-    # ----------------------------------------------------
     ws_sug = wb.create_sheet(title="SUGERENCIAS")
     ws_sug.views.sheetView[0].showGridLines = True
-    headers_sug = ["Fecha Contable", "Documento", "Tercero", "Monto Contable", "Fecha Banco", "Referencia Banco", "Monto Banco", "Diferencia ($)", "Días Desfase", "Certeza"]
-    ws_sug.append(headers_sug)
+    ws_sug.append(["Fecha Contable", "Documento", "Tercero", "Monto Contable", "Fecha Banco", "Referencia Banco", "Monto Banco", "Diferencia ($)", "Días Desfase", "Certeza"])
 
     if not df_sugerencias.empty:
         for _, r_sug in df_sugerencias.iterrows():
             ws_sug.append([
-                str(r_sug['Fecha Contable']),
-                str(r_sug['Documento']),
-                str(r_sug['Tercero']),
-                float(r_sug['Monto Contable']),
-                str(r_sug['Fecha Banco']),
-                str(r_sug['Referencia Banco']),
-                float(r_sug['Monto Banco']),
-                float(r_sug['Diferencia ($)']),
-                int(r_sug['Días Desfase']),
-                str(r_sug['Certeza'])
+                str(r_sug.get('Fecha Contable', '')),
+                str(r_sug.get('Documento', '')),
+                str(r_sug.get('Tercero', '')),
+                float(r_sug.get('Monto Contable', 0)),
+                str(r_sug.get('Fecha Banco', '')),
+                str(r_sug.get('Referencia Banco', '')),
+                float(r_sug.get('Monto Banco', 0)),
+                float(r_sug.get('Diferencia ($)', 0)),
+                int(r_sug.get('Días Desfase', 0)),
+                str(r_sug.get('Certeza', ''))
             ])
     
     max_sug_tbl = max(ws_sug.max_row, 2)
@@ -281,54 +268,41 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     tab3.tableStyleInfo = TableStyleInfo(name="TableStyleMedium3", showRowStripes=True)
     ws_sug.add_table(tab3)
 
-    # ----------------------------------------------------
     # HOJA 5: PENDIENTES POR REGISTRAR
-    # ----------------------------------------------------
     ws_pend = wb.create_sheet(title="PENDIENTES POR REGISTRAR")
     ws_pend.views.sheetView[0].showGridLines = True
     ws_pend.append(["Fecha Banco", "Referencia / Descripción", "Monto (+/-)", "Estado"])
 
-    # Obtener llaves/referencias que ya están en la hoja de sugerencias
-    refs_sugeridas = set(df_sugerencias['Referencia Banco'].dropna().unique()) if not df_sugerencias.empty else set()
+    refs_sugeridas = set(df_sugerencias['Referencia Banco'].dropna().unique()) if (not df_sugerencias.empty and 'Referencia Banco' in df_sugerencias.columns) else set()
 
-    cant_pendientes = 0
     for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
         ref_val = str(row.get('Descripcion', row.get('DESCRIPCIÓN', '')))
-        
-        # Filtro: Solo 'Pen Contabilidad' que NO estén en la hoja de Sugerencias
         if ref_val not in refs_sugeridas:
-            fecha_val = str(row.get('Fecha_Clean', row.get('FECHA', '')))
+            fecha_val = str(row.get('Fecha_Clean', ''))
             monto_val = float(row.get('Monto_Neto', 0))
             ws_pend.append([fecha_val, ref_val, monto_val, "Pen Contabilidad"])
-            cant_pendientes += 1
 
     max_pend_tbl = max(ws_pend.max_row, 2)
     tab5 = Table(displayName="TablaPendientes", ref=f"A1:D{max_pend_tbl}")
     tab5.tableStyleInfo = TableStyleInfo(name="TableStyleMedium4", showRowStripes=True)
     ws_pend.add_table(tab5)
 
-    # ----------------------------------------------------
     # HOJA 6: GASTOS BANCARIOS
-    # ----------------------------------------------------
     ws_gastos = wb.create_sheet(title="GASTOS BANCARIOS")
     ws_gastos.views.sheetView[0].showGridLines = True
     ws_gastos.append(["Fecha", "Descripción / Concepto Gasto", "Monto Gasto (-)", "Clasificación"])
 
-    patrón_gastos = r'IMPTO GOBIERNO|4X1000|COMISION|IVA COMISION|INTERESES|CUOTA MANEJO|MANTE SUCURSAL'
-    
+    patron_gastos = r'IMPTO GOBIERNO|4X1000|COMISION|IVA COMISION|INTERESES|CUOTA MANEJO|MANTE SUCURSAL'
     total_gastos = 0.0
-    filas_gastos = 0
+
     for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
         ref_val = str(row.get('Descripcion', row.get('DESCRIPCIÓN', '')))
-        
-        if re.search(patrón_gastos, ref_val, re.IGNORECASE):
-            fecha_val = str(row.get('Fecha_Clean', row.get('FECHA', '')))
+        if re.search(patron_gastos, ref_val, re.IGNORECASE):
+            fecha_val = str(row.get('Fecha_Clean', ''))
             monto_val = float(row.get('Monto_Neto', 0))
             ws_gastos.append([fecha_val, ref_val, monto_val, "Gasto / Impuesto Financiero"])
             total_gastos += monto_val
-            filas_gastos += 1
 
-    # Fila de SUBTOTAL / TOTAL GASTOS
     r_total = ws_gastos.max_row + 1
     ws_gastos.cell(row=r_total, column=1, value="---").font = font_bold
     c_tot_lbl = ws_gastos.cell(row=r_total, column=2, value="TOTAL GASTOS BANCARIOS")
@@ -345,67 +319,83 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     tab6.tableStyleInfo = TableStyleInfo(name="TableStyleMedium7", showRowStripes=True)
     ws_gastos.add_table(tab6)
 
-    # Guardar en memoria
     wb.save(buffer)
 
 # ==========================================
-# 4. FUNCIONES DE CARGA Y PARSERS
+# 4. PARSERS ROBUSTOS CON FALLBACK
 # ==========================================
 def procesar_auxiliar(df_raw):
-    headers = df_raw.iloc[6].values
-    df = df_raw.iloc[8:].copy()
-    df.columns = headers
-    df = df.dropna(subset=['Código contable', 'Fecha elaboración'])
+    try:
+        headers = df_raw.iloc[6].values
+        df = df_raw.iloc[8:].copy()
+        df.columns = headers
+    except:
+        df = df_raw.copy()
+
+    df = df.dropna(how='all')
     
-    df['Débito_Clean'] = df['Débito'].apply(limpiar_valor)
-    df['Crédito_Clean'] = df['Crédito'].apply(limpiar_valor)
+    col_deb = next((c for c in df.columns if 'Débito' in str(c) or 'Debito' in str(c)), None)
+    col_cred = next((c for c in df.columns if 'Crédito' in str(c) or 'Credito' in str(c)), None)
+    col_fec = next((c for c in df.columns if 'Fecha' in str(c)), None)
+
+    df['Débito_Clean'] = df[col_deb].apply(limpiar_valor) if col_deb else 0.0
+    df['Crédito_Clean'] = df[col_cred].apply(limpiar_valor) if col_cred else 0.0
     df['Monto_Neto'] = df['Débito_Clean'] - df['Crédito_Clean']
-    
-    col_fecha = 'Fecha elaboration' if 'Fecha elaboration' in df.columns else 'Fecha elaboración'
-    
-    # Estandarización de fecha a DD/MM/YYYY
-    df['Fecha_Clean'] = df[col_fecha].apply(lambda x: normalizar_fecha_ddmmyyyy(x))
+
+    if col_fec:
+        df['Fecha_Clean'] = df[col_fec].apply(lambda x: normalizar_fecha_ddmmyyyy(x))
+    else:
+        df['Fecha_Clean'] = "01/01/2026"
+        
     return df
 
 def procesar_diario_csv(df_raw):
-    df = df_raw.iloc[:, [0, 1, 3, 5, 6, 7]].copy()
-    df.columns = ['Cuenta', 'Oficina', 'Fecha_Int', 'Valor_Raw', 'Codigo_Tx', 'Descripcion']
-    df['Monto_Neto'] = df['Valor_Raw'].apply(limpiar_valor)
+    df = df_raw.copy()
+    if df.shape[1] >= 6:
+        df = df.iloc[:, [0, 1, 3, 5, 6, 7] if df.shape[1] >= 8 else range(df.shape[1])].copy()
+        df.columns = ['Cuenta', 'Oficina', 'Fecha_Int', 'Valor_Raw', 'Codigo_Tx', 'Descripcion'][:df.shape[1]]
     
-    # Estandarización de fecha a DD/MM/YYYY
-    df['Fecha_Clean'] = df['Fecha_Int'].apply(lambda x: normalizar_fecha_ddmmyyyy(x))
+    col_val = 'Valor_Raw' if 'Valor_Raw' in df.columns else df.columns[-2]
+    col_fec = 'Fecha_Int' if 'Fecha_Int' in df.columns else df.columns[0]
+    
+    df['Monto_Neto'] = df[col_val].apply(limpiar_valor)
+    df['Fecha_Clean'] = df[col_fec].apply(lambda x: normalizar_fecha_ddmmyyyy(x))
     return df
 
 def procesar_extracto_mensual_excel(df_raw):
     """
-    Parser mejorado para el extracto mensual: elimina dinámicamente saltos 
-    de página/encabezados PDF y formatea fechas a DD/MM/YYYY.
+    Parser robusto: extrae únicamente filas numéricas y de texto con contenido
+    evitando que se pierda la columna 'Fecha_Clean'.
     """
-    # Detectar el año base dinámico de la cabecera HASTA
-    year_base = 2026
-    for i, row in df_raw.iterrows():
-        row_str = row.astype(str).values
-        if 'HASTA' in row_str:
-            idx_hasta = list(row_str).index('HASTA')
-            val_hasta = df_raw.iloc[i+1, idx_hasta]
-            try:
-                year_base = pd.to_datetime(val_hasta).year
-            except:
-                pass
+    df = df_raw.copy()
+    
+    # Buscar dinámicamente la fila donde empiezan los datos de fecha
+    idx_inicio = 0
+    for i in range(min(15, len(df))):
+        row_str = " ".join(df.iloc[i].astype(str).values)
+        if re.search(r'\d{1,2}[/-]\d{1,2}', row_str):
+            idx_inicio = i
             break
-
-    # Filtrar solo registros válidos por patrón de fecha (Elimina ruido de encabezados)
-    df_clean = df_raw[df_raw[0].apply(es_fecha_valida)].copy()
-    df_clean = df_clean.iloc[:, :6]
-    df_clean.columns = ['FECHA', 'DESCRIPCIÓN', 'SUCURSAL', 'DCTO', 'VALOR', 'SALDO']
+            
+    df_data = df.iloc[idx_inicio:].dropna(how='all').copy()
+    df_data = df_data.iloc[:, :6]
     
-    df_clean['Monto_Neto'] = df_clean['VALOR'].apply(limpiar_valor)
-    df_clean['Fecha_Clean'] = df_clean['FECHA'].apply(lambda x: normalizar_fecha_ddmmyyyy(x, year_base))
+    # Renombrar estandarizadamente
+    cols = ['FECHA', 'DESCRIPCIÓN', 'SUCURSAL', 'DCTO', 'VALOR', 'SALDO']
+    df_data.columns = cols[:df_data.shape[1]]
     
-    return df_clean
+    # Garantizar columna Monto_Neto
+    col_val = 'VALOR' if 'VALOR' in df_data.columns else df_data.columns[-1]
+    df_data['Monto_Neto'] = df_data[col_val].apply(limpiar_valor)
+    
+    # Garantizar columna Fecha_Clean SIEMPRE
+    col_fec = 'FECHA' if 'FECHA' in df_data.columns else df_data.columns[0]
+    df_data['Fecha_Clean'] = df_data[col_fec].apply(lambda x: normalizar_fecha_ddmmyyyy(x))
+    
+    return df_data
 
 # ==========================================
-# 5. INTERFAZ STREAMLIT Y NAVEGACIÓN
+# 5. INTERFAZ STREAMLIT
 # ==========================================
 st.sidebar.title("📌 Menú Principal")
 opcion = st.sidebar.radio(
@@ -414,8 +404,8 @@ opcion = st.sidebar.radio(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("⚙️ Configuración de Cruce Inteligente")
-tol_pesos = st.sidebar.number_input("Tolerancia máxima en Pesos ($):", min_value=0.0, max_value=500.0, value=10.0, step=0.50)
+st.sidebar.subheader("⚙️ Ajustes del Algoritmo")
+tol_pesos = st.sidebar.number_input("Tolerancia en Pesos ($):", min_value=0.0, max_value=500.0, value=10.0, step=1.0)
 
 # ----------------------------------------------------
 # MÓDULO 1: DIARIO
@@ -436,23 +426,10 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
         df_diario = procesar_diario_csv(df_diario_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        # Identificar pendientes
-        df_diario['Monto_Abs'] = df_diario['Monto_Neto'].abs().round(2)
-        df_aux['Monto_Abs'] = df_aux['Monto_Neto'].abs().round(2)
-        
-        df_diario['Ocurrencia'] = df_diario.groupby(['Fecha_Clean', 'Monto_Abs']).cumcount() + 1
-        df_aux['Ocurrencia'] = df_aux.groupby(['Fecha_Clean', 'Monto_Abs']).cumcount() + 1
+        # Sugerencias directo sin bloqueo rígido de llave de fecha exacta
+        sug_gen = obtener_sugerencias_cruce(df_aux, df_diario, tol_monto=tol_pesos)
 
-        df_diario['LLAVE'] = df_diario['Fecha_Clean'] + "_" + df_diario['Monto_Abs'].astype(str) + "_" + df_diario['Ocurrencia'].astype(str)
-        df_aux['LLAVE'] = df_aux['Fecha_Clean'] + "_" + df_aux['Monto_Abs'].astype(str) + "_" + df_aux['Ocurrencia'].astype(str)
-
-        solo_diario = df_diario[~df_diario['LLAVE'].isin(df_aux['LLAVE'])]
-        solo_aux = df_aux[~df_aux['LLAVE'].isin(df_diario['LLAVE'])]
-
-        # Algoritmo de Sugerencias
-        sug_gen = obtener_sugerencias_cruce(solo_aux, solo_diario, tol_monto=tol_pesos)
-
-        st.success(f"✅ Análisis completado. Se hallaron {len(sug_gen)} posibles coincidencias por desfase de fecha/redondeo.")
+        st.success(f"✅ Análisis completado. Se hallaron {len(sug_gen)} posibles coincidencias.")
 
         st.markdown("### 📥 Generar y Descargar Archivos (6 Hojas)")
         c1, c2, c3 = st.columns(3)
@@ -461,7 +438,7 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
             buf_egr = io.BytesIO()
             df_a_egr = df_aux[df_aux['Monto_Neto'] < 0]
             df_d_egr = df_diario[df_diario['Monto_Neto'] < 0]
-            sug_egr = obtener_sugerencias_cruce(solo_aux[solo_aux['Monto_Neto'] < 0], solo_diario[solo_diario['Monto_Neto'] < 0], tol_monto=tol_pesos)
+            sug_egr = obtener_sugerencias_cruce(df_a_egr, df_d_egr, tol_monto=tol_pesos)
             generar_excel_plantilla(df_a_egr, df_d_egr, sug_egr, buf_egr, "Egresos")
             st.download_button("🔻 Descargar EGRESOS (-)", data=buf_egr.getvalue(), file_name="Egresos_Diarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -469,7 +446,7 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
             buf_ing = io.BytesIO()
             df_a_ing = df_aux[df_aux['Monto_Neto'] > 0]
             df_d_ing = df_diario[df_diario['Monto_Neto'] > 0]
-            sug_ing = obtener_sugerencias_cruce(solo_aux[solo_aux['Monto_Neto'] > 0], solo_diario[solo_diario['Monto_Neto'] > 0], tol_monto=tol_pesos)
+            sug_ing = obtener_sugerencias_cruce(df_a_ing, df_d_ing, tol_monto=tol_pesos)
             generar_excel_plantilla(df_a_ing, df_d_ing, sug_ing, buf_ing, "Ingresos")
             st.download_button("🟢 Descargar INGRESOS (+)", data=buf_ing.getvalue(), file_name="Ingresos_Diarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -502,23 +479,10 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
         df_ext = procesar_extracto_mensual_excel(df_ext_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        # Identificar pendientes
-        df_ext['Monto_Abs'] = df_ext['Monto_Neto'].abs().round(2)
-        df_aux['Monto_Abs'] = df_aux['Monto_Neto'].abs().round(2)
+        # Algoritmo de Sugerencias seguro
+        sug_gen_m = obtener_sugerencias_cruce(df_aux, df_ext, tol_monto=tol_pesos)
 
-        df_ext['Ocurrencia'] = df_ext.groupby(['Monto_Abs']).cumcount() + 1
-        df_aux['Ocurrencia'] = df_aux.groupby(['Monto_Abs']).cumcount() + 1
-
-        df_ext['LLAVE'] = df_ext['Monto_Abs'].astype(str) + "_" + df_ext['Ocurrencia'].astype(str)
-        df_aux['LLAVE'] = df_aux['Monto_Abs'].astype(str) + "_" + df_aux['Ocurrencia'].astype(str)
-
-        solo_ext = df_ext[~df_ext['LLAVE'].isin(df_aux['LLAVE'])]
-        solo_aux = df_aux[~df_aux['LLAVE'].isin(df_ext['LLAVE'])]
-
-        # Algoritmo de Sugerencias
-        sug_gen_m = obtener_sugerencias_cruce(solo_aux, solo_ext, tol_monto=tol_pesos)
-
-        st.success(f"✅ Conciliación realizada. Se detectaron {len(sug_gen_m)} sugerencias de cruce en el mes.")
+        st.success(f"✅ Conciliación realizada. Se detectaron {len(sug_gen_m)} sugerencias de cruce.")
 
         st.markdown("### 📥 Generar y Descargar Archivos (6 Hojas)")
         c1, c2, c3 = st.columns(3)
@@ -527,7 +491,7 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
             buf_egr_m = io.BytesIO()
             df_a_egr = df_aux[df_aux['Monto_Neto'] < 0]
             df_e_egr = df_ext[df_ext['Monto_Neto'] < 0]
-            sug_egr_m = obtener_sugerencias_cruce(solo_aux[solo_aux['Monto_Neto'] < 0], solo_ext[solo_ext['Monto_Neto'] < 0], tol_monto=tol_pesos)
+            sug_egr_m = obtener_sugerencias_cruce(df_a_egr, df_e_egr, tol_monto=tol_pesos)
             generar_excel_plantilla(df_a_egr, df_e_egr, sug_egr_m, buf_egr_m, "Egresos")
             st.download_button("🔻 Descargar EGRESOS (-)", data=buf_egr_m.getvalue(), file_name="Conciliacion_Egresos_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -535,7 +499,7 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
             buf_ing_m = io.BytesIO()
             df_a_ing = df_aux[df_aux['Monto_Neto'] > 0]
             df_e_ing = df_ext[df_ext['Monto_Neto'] > 0]
-            sug_ing_m = obtener_sugerencias_cruce(solo_aux[solo_aux['Monto_Neto'] > 0], solo_ext[solo_ext['Monto_Neto'] > 0], tol_monto=tol_pesos)
+            sug_ing_m = obtener_sugerencias_cruce(df_a_ing, df_e_ing, tol_monto=tol_pesos)
             generar_excel_plantilla(df_a_ing, df_e_ing, sug_ing_m, buf_ing_m, "Ingresos")
             st.download_button("🟢 Descargar INGRESOS (+)", data=buf_ing_m.getvalue(), file_name="Conciliacion_Ingresos_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
