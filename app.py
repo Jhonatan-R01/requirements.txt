@@ -14,23 +14,17 @@ st.set_page_config(page_title="Sistema de Conciliación & Control Diario", layou
 def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
     sugerencias = []
     
-    if df_aux_pend.empty or df_ext_pend.empty:
-        return pd.DataFrame(sugerencias)
-
+    # Copia con fechas procesadas en formato datetime para cálculos
     aux_tmp = df_aux_pend.copy()
     ext_tmp = df_ext_pend.copy()
     
-    # Manejo seguro de la columna de fecha
-    col_f_aux = 'Fecha_Clean' if 'Fecha_Clean' in aux_tmp.columns else 'Fecha elaboración'
-    col_f_ext = 'Fecha_Clean' if 'Fecha_Clean' in ext_tmp.columns else 'FECHA'
-    
-    aux_tmp['Fecha_dt'] = pd.to_datetime(aux_tmp[col_f_aux], errors='coerce')
-    ext_tmp['Fecha_dt'] = pd.to_datetime(ext_tmp[col_f_ext], errors='coerce')
+    aux_tmp['Fecha_dt'] = pd.to_datetime(aux_tmp['Fecha_Clean'], errors='coerce')
+    ext_tmp['Fecha_dt'] = pd.to_datetime(ext_tmp['Fecha_Clean'], errors='coerce')
 
     ext_usados = set()
 
     for idx_a, row_a in aux_tmp.iterrows():
-        monto_a = float(row_a.get('Monto_Neto', 0))
+        monto_a = float(row_a['Monto_Neto'])
         fecha_a = row_a['Fecha_dt']
         
         if pd.isna(fecha_a):
@@ -41,7 +35,7 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
             if idx_e in ext_usados:
                 continue
                 
-            monto_e = float(row_e.get('Monto_Neto', 0))
+            monto_e = float(row_e['Monto_Neto'])
             fecha_e = row_e['Fecha_dt']
             
             if pd.isna(fecha_e):
@@ -51,31 +45,28 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
             if (fecha_a.year == fecha_e.year) and (fecha_a.month == fecha_e.month):
                 diff_monto = abs(monto_a - monto_e)
                 
-                # Regla 2: Monto dentro de la tolerancia en pesos
+                # Regla 2: Monto dentro de la tolerancia de centavos/pesos
                 if diff_monto <= tol_monto:
                     dias_desfase = abs((fecha_e - fecha_a).days)
-                    ref_banco = row_e.get('Descripcion', row_e.get('DESCRIPCIÓN', ''))
-                    fecha_banco_str = str(row_e.get(col_f_ext, ''))
-                    
                     candidatos.append({
                         'idx_e': idx_e,
-                        'Fecha_Banco': fecha_banco_str,
-                        'Ref_Banco': ref_banco,
+                        'Fecha_Banco': row_e['Fecha_Clean'],
+                        'Ref_Banco': row_e.get('Descripcion', row_e.get('DESCRIPCIÓN', '')),
                         'Monto_Banco': monto_e,
                         'Diff_Monto': diff_monto,
                         'Dias_Desfase': dias_desfase
                     })
 
         if candidatos:
+            # Ordenar candidatos: primero menor diferencia en monto, luego menor desfase en días
             candidatos.sort(key=lambda x: (x['Diff_Monto'], x['Dias_Desfase']))
             mejor = candidatos[0]
             ext_usados.add(mejor['idx_e'])
             
             certeza = "Alta (Exacto)" if mejor['Diff_Monto'] == 0 else f"Media (Diff: ${mejor['Diff_Monto']:.2f})"
-            fecha_contable_str = str(row_a.get(col_f_aux, ''))
-
+            
             sugerencias.append({
-                'Fecha Contable': fecha_contable_str,
+                'Fecha Contable': row_a['Fecha_Clean'],
                 'Documento': row_a.get('Comprobante', ''),
                 'Tercero': row_a.get('Nombre del tercero', ''),
                 'Monto Contable': monto_a,
@@ -285,9 +276,7 @@ def procesar_extracto_excel(df_raw):
     df.columns = ['FECHA', 'DESCRIPCIÓN', 'SUCURSAL', 'DCTO', 'VALOR', 'SALDO', 'X1', 'X2']
     df = df.dropna(subset=['FECHA', 'VALOR'])
     df = df[~df['FECHA'].astype(str).str.contains('FECHA|FIN ESTADO', case=False, na=False)]
-    
     df['Monto_Neto'] = df['VALOR'].apply(limpiar_valor)
-    df['Fecha_Clean'] = pd.to_datetime(df['FECHA'], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')
     return df
 
 # ==========================================
@@ -314,16 +303,12 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
 
     if file_diario and file_auxiliar:
         df_diario_raw = pd.read_csv(file_diario, encoding="latin1", header=None)
-        
-        # Lectura explícita de Sheet1
-        try:
-            df_aux_raw = pd.read_excel(file_auxiliar, sheet_name='Sheet1')
-        except Exception:
-            df_aux_raw = pd.read_excel(file_auxiliar, sheet_name=0)
+        df_aux_raw = pd.read_excel(file_auxiliar)
 
         df_diario = procesar_diario_csv(df_diario_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
+        # Identificar pendientes exactos
         df_diario['Monto_Abs'] = df_diario['Monto_Neto'].abs().round(2)
         df_aux['Monto_Abs'] = df_aux['Monto_Neto'].abs().round(2)
         
@@ -336,6 +321,7 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
         solo_diario = df_diario[~df_diario['LLAVE'].isin(df_aux['LLAVE'])]
         solo_aux = df_aux[~df_aux['LLAVE'].isin(df_diario['LLAVE'])]
 
+        # Algoritmo de Sugerencias
         sug_gen = obtener_sugerencias_cruce(solo_aux, solo_diario, tol_monto=tol_pesos)
 
         st.success(f"✅ Análisis completado. Se hallaron {len(sug_gen)} posibles coincidencias por desfase de fecha/redondeo.")
@@ -380,16 +366,12 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
 
     if file_ext and file_auxiliar:
         df_ext_raw = pd.read_excel(file_ext, header=None)
-        
-        # Lectura explícita de Sheet1
-        try:
-            df_aux_raw = pd.read_excel(file_auxiliar, sheet_name='Sheet1')
-        except Exception:
-            df_aux_raw = pd.read_excel(file_auxiliar, sheet_name=0)
+        df_aux_raw = pd.read_excel(file_auxiliar)
 
         df_ext = procesar_extracto_excel(df_ext_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
+        # Identificar pendientes exactos
         df_ext['Monto_Abs'] = df_ext['Monto_Neto'].abs().round(2)
         df_aux['Monto_Abs'] = df_aux['Monto_Neto'].abs().round(2)
 
@@ -402,6 +384,7 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
         solo_ext = df_ext[~df_ext['LLAVE'].isin(df_aux['LLAVE'])]
         solo_aux = df_aux[~df_aux['LLAVE'].isin(df_ext['LLAVE'])]
 
+        # Algoritmo de Sugerencias
         sug_gen_m = obtener_sugerencias_cruce(solo_aux, solo_ext, tol_monto=tol_pesos)
 
         st.success(f"✅ Conciliación realizada. Se detectaron {len(sug_gen_m)} sugerencias de cruce en el mes.")
