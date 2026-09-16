@@ -9,9 +9,81 @@ import streamlit as st
 st.set_page_config(page_title="Sistema de Conciliación & Control Diario", layout="wide")
 
 # ==========================================
-# 1. FUNCIÓN PARA GENERAR EXCEL SIN #REF!
+# 1. ALGORITMO DE SUGERENCIAS INTELIGENTES
 # ==========================================
-def generar_excel_plantilla(df_aux_proc, df_ext_proc, buffer, tipo_reporte="General"):
+def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
+    sugerencias = []
+    
+    # Copia con fechas procesadas en formato datetime para cálculos
+    aux_tmp = df_aux_pend.copy()
+    ext_tmp = df_ext_pend.copy()
+    
+    aux_tmp['Fecha_dt'] = pd.to_datetime(aux_tmp['Fecha_Clean'], errors='coerce')
+    ext_tmp['Fecha_dt'] = pd.to_datetime(ext_tmp['Fecha_Clean'], errors='coerce')
+
+    ext_usados = set()
+
+    for idx_a, row_a in aux_tmp.iterrows():
+        monto_a = float(row_a['Monto_Neto'])
+        fecha_a = row_a['Fecha_dt']
+        
+        if pd.isna(fecha_a):
+            continue
+
+        candidatos = []
+        for idx_e, row_e in ext_tmp.iterrows():
+            if idx_e in ext_usados:
+                continue
+                
+            monto_e = float(row_e['Monto_Neto'])
+            fecha_e = row_e['Fecha_dt']
+            
+            if pd.isna(fecha_e):
+                continue
+
+            # Regla 1: Mismo Mes y Mismo Año
+            if (fecha_a.year == fecha_e.year) and (fecha_a.month == fecha_e.month):
+                diff_monto = abs(monto_a - monto_e)
+                
+                # Regla 2: Monto dentro de la tolerancia de centavos/pesos
+                if diff_monto <= tol_monto:
+                    dias_desfase = abs((fecha_e - fecha_a).days)
+                    candidatos.append({
+                        'idx_e': idx_e,
+                        'Fecha_Banco': row_e['Fecha_Clean'],
+                        'Ref_Banco': row_e.get('Descripcion', row_e.get('DESCRIPCIÓN', '')),
+                        'Monto_Banco': monto_e,
+                        'Diff_Monto': diff_monto,
+                        'Dias_Desfase': dias_desfase
+                    })
+
+        if candidatos:
+            # Ordenar candidatos: primero menor diferencia en monto, luego menor desfase en días
+            candidatos.sort(key=lambda x: (x['Diff_Monto'], x['Dias_Desfase']))
+            mejor = candidatos[0]
+            ext_usados.add(mejor['idx_e'])
+            
+            certeza = "Alta (Exacto)" if mejor['Diff_Monto'] == 0 else f"Media (Diff: ${mejor['Diff_Monto']:.2f})"
+            
+            sugerencias.append({
+                'Fecha Contable': row_a['Fecha_Clean'],
+                'Documento': row_a.get('Comprobante', ''),
+                'Tercero': row_a.get('Nombre del tercero', ''),
+                'Monto Contable': monto_a,
+                'Fecha Banco': mejor['Fecha_Banco'],
+                'Referencia Banco': mejor['Ref_Banco'],
+                'Monto Banco': mejor['Monto_Banco'],
+                'Diferencia ($)': mejor['Diff_Monto'],
+                'Días Desfase': mejor['Dias_Desfase'],
+                'Certeza': certeza
+            })
+
+    return pd.DataFrame(sugerencias)
+
+# ==========================================
+# 2. FUNCIÓN PARA GENERAR EXCEL MULTI-PESTAÑA
+# ==========================================
+def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, tipo_reporte="General"):
     wb = openpyxl.Workbook()
 
     # --- HOJA 1: Resumen Conciliación ---
@@ -52,7 +124,6 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, buffer, tipo_reporte="Gene
     max_aux = len(df_aux_proc) + 1
     max_ext = len(df_ext_proc) + 1
 
-    # Fórmulas directas por coordenadas de celda (evita errores #REF!)
     filas = [
         ("Saldo Mov según Auxiliar Contable", f"=SUM('Auxiliar Contable'!E2:E{max(max_aux, 2)})", None),
         ("(+) Partidas No registradas por el Banco", f'=SUMIF(\'Auxiliar Contable\'!G2:G{max(max_aux, 2)}, "NO ESTA EN BANCOS", \'Auxiliar Contable\'!E2:E{max(max_aux, 2)})', "Movimientos en libros pendientes en extracto"),
@@ -134,10 +205,37 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, buffer, tipo_reporte="Gene
     tab2.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
     ws_ext.add_table(tab2)
 
+    # --- HOJA 4: Sugerencias de Cruce ---
+    ws_sug = wb.create_sheet(title="Sugerencias de Cruce")
+    ws_sug.views.sheetView[0].showGridLines = True
+    
+    headers_sug = ["Fecha Contable", "Documento", "Tercero", "Monto Contable", "Fecha Banco", "Referencia Banco", "Monto Banco", "Diferencia ($)", "Días Desfase", "Certeza"]
+    ws_sug.append(headers_sug)
+
+    if not df_sugerencias.empty:
+        for _, r_sug in df_sugerencias.iterrows():
+            ws_sug.append([
+                str(r_sug['Fecha Contable']),
+                str(r_sug['Documento']),
+                str(r_sug['Tercero']),
+                float(r_sug['Monto Contable']),
+                str(r_sug['Fecha Banco']),
+                str(r_sug['Referencia Banco']),
+                float(r_sug['Monto Banco']),
+                float(r_sug['Diferencia ($)']),
+                int(r_sug['Días Desfase']),
+                str(r_sug['Certeza'])
+            ])
+    
+    max_sug_tbl = max(ws_sug.max_row, 2)
+    tab3 = Table(displayName="Tabla3", ref=f"A1:J{max_sug_tbl}")
+    tab3.tableStyleInfo = TableStyleInfo(name="TableStyleMedium3", showRowStripes=True)
+    ws_sug.add_table(tab3)
+
     wb.save(buffer)
 
 # ==========================================
-# 2. FUNCIONES DE PROCESAMIENTO
+# 3. FUNCIONES DE PROCESAMIENTO
 # ==========================================
 def limpiar_valor(val):
     if pd.isna(val):
@@ -182,13 +280,17 @@ def procesar_extracto_excel(df_raw):
     return df
 
 # ==========================================
-# 3. INTERFAZ Y NAVEGACIÓN
+# 4. INTERFAZ Y NAVEGACIÓN
 # ==========================================
 st.sidebar.title("📌 Menú Principal")
 opcion = st.sidebar.radio(
     "Selecciona el módulo:",
     ["📖 1. Cruce Diario (CSV vs Auxiliar)", "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)"]
 )
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ Configuración de Cruce Inteligente")
+tol_pesos = st.sidebar.number_input("Tolerancia máxima en Pesos ($):", min_value=0.0, max_value=500.0, value=10.0, step=0.50)
 
 if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
     st.title("📖 Cruce Operativo Diario")
@@ -206,25 +308,52 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
         df_diario = procesar_diario_csv(df_diario_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        st.success("✅ Archivos procesados con éxito.")
+        # Identificar pendientes exactos
+        df_diario['Monto_Abs'] = df_diario['Monto_Neto'].abs().round(2)
+        df_aux['Monto_Abs'] = df_aux['Monto_Neto'].abs().round(2)
+        
+        df_diario['Ocurrencia'] = df_diario.groupby(['Fecha_Clean', 'Monto_Abs']).cumcount() + 1
+        df_aux['Ocurrencia'] = df_aux.groupby(['Fecha_Clean', 'Monto_Abs']).cumcount() + 1
+
+        df_diario['LLAVE'] = df_diario['Fecha_Clean'] + "_" + df_diario['Monto_Abs'].astype(str) + "_" + df_diario['Ocurrencia'].astype(str)
+        df_aux['LLAVE'] = df_aux['Fecha_Clean'] + "_" + df_aux['Monto_Abs'].astype(str) + "_" + df_aux['Ocurrencia'].astype(str)
+
+        solo_diario = df_diario[~df_diario['LLAVE'].isin(df_aux['LLAVE'])]
+        solo_aux = df_aux[~df_aux['LLAVE'].isin(df_diario['LLAVE'])]
+
+        # Algoritmo de Sugerencias
+        sug_gen = obtener_sugerencias_cruce(solo_aux, solo_diario, tol_monto=tol_pesos)
+
+        st.success(f"✅ Análisis completado. Se hallaron {len(sug_gen)} posibles coincidencias por desfase de fecha/redondeo.")
 
         st.markdown("### 📥 Generar y Descargar Archivos")
         c1, c2, c3 = st.columns(3)
 
         with c1:
             buf_egr = io.BytesIO()
-            generar_excel_plantilla(df_aux[df_aux['Monto_Neto'] < 0], df_diario[df_diario['Monto_Neto'] < 0], buf_egr, "Egresos")
+            df_a_egr = df_aux[df_aux['Monto_Neto'] < 0]
+            df_d_egr = df_diario[df_diario['Monto_Neto'] < 0]
+            sug_egr = obtener_sugerencias_cruce(solo_aux[solo_aux['Monto_Neto'] < 0], solo_diario[solo_diario['Monto_Neto'] < 0], tol_monto=tol_pesos)
+            generar_excel_plantilla(df_a_egr, df_d_egr, sug_egr, buf_egr, "Egresos")
             st.download_button("🔻 Descargar EGRESOS (-)", data=buf_egr.getvalue(), file_name="Egresos_Diarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         with c2:
             buf_ing = io.BytesIO()
-            generar_excel_plantilla(df_aux[df_aux['Monto_Neto'] > 0], df_diario[df_diario['Monto_Neto'] > 0], buf_ing, "Ingresos")
+            df_a_ing = df_aux[df_aux['Monto_Neto'] > 0]
+            df_d_ing = df_diario[df_diario['Monto_Neto'] > 0]
+            sug_ing = obtener_sugerencias_cruce(solo_aux[solo_aux['Monto_Neto'] > 0], solo_diario[solo_diario['Monto_Neto'] > 0], tol_monto=tol_pesos)
+            generar_excel_plantilla(df_a_ing, df_d_ing, sug_ing, buf_ing, "Ingresos")
             st.download_button("🟢 Descargar INGRESOS (+)", data=buf_ing.getvalue(), file_name="Ingresos_Diarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         with c3:
             buf_gen = io.BytesIO()
-            generar_excel_plantilla(df_aux, df_diario, buf_gen, "General_Consolidado")
+            generar_excel_plantilla(df_aux, df_diario, sug_gen, buf_gen, "General_Consolidado")
             st.download_button("📦 Descargar GENERAL", data=buf_gen.getvalue(), file_name="General_Diarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        if not sug_gen.empty:
+            st.markdown("---")
+            st.subheader("💡 Vista Previa: Posibles Sugerencias de Cruce Halladas")
+            st.dataframe(sug_gen)
 
 elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
     st.title("📊 Conciliación Bancaria Mensual")
@@ -242,22 +371,49 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
         df_ext = procesar_extracto_excel(df_ext_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        st.success("✅ Conciliación calculada correctamente.")
+        # Identificar pendientes exactos
+        df_ext['Monto_Abs'] = df_ext['Monto_Neto'].abs().round(2)
+        df_aux['Monto_Abs'] = df_aux['Monto_Neto'].abs().round(2)
+
+        df_ext['Ocurrencia'] = df_ext.groupby(['Monto_Abs']).cumcount() + 1
+        df_aux['Ocurrencia'] = df_aux.groupby(['Monto_Abs']).cumcount() + 1
+
+        df_ext['LLAVE'] = df_ext['Monto_Abs'].astype(str) + "_" + df_ext['Ocurrencia'].astype(str)
+        df_aux['LLAVE'] = df_aux['Monto_Abs'].astype(str) + "_" + df_aux['Ocurrencia'].astype(str)
+
+        solo_ext = df_ext[~df_ext['LLAVE'].isin(df_aux['LLAVE'])]
+        solo_aux = df_aux[~df_aux['LLAVE'].isin(df_ext['LLAVE'])]
+
+        # Algoritmo de Sugerencias
+        sug_gen_m = obtener_sugerencias_cruce(solo_aux, solo_ext, tol_monto=tol_pesos)
+
+        st.success(f"✅ Conciliación realizada. Se detectaron {len(sug_gen_m)} sugerencias de cruce en el mes.")
 
         st.markdown("### 📥 Generar y Descargar Archivos")
         c1, c2, c3 = st.columns(3)
 
         with c1:
             buf_egr_m = io.BytesIO()
-            generar_excel_plantilla(df_aux[df_aux['Monto_Neto'] < 0], df_ext[df_ext['Monto_Neto'] < 0], buf_egr_m, "Egresos")
+            df_a_egr = df_aux[df_aux['Monto_Neto'] < 0]
+            df_e_egr = df_ext[df_ext['Monto_Neto'] < 0]
+            sug_egr_m = obtener_sugerencias_cruce(solo_aux[solo_aux['Monto_Neto'] < 0], solo_ext[solo_ext['Monto_Neto'] < 0], tol_monto=tol_pesos)
+            generar_excel_plantilla(df_a_egr, df_e_egr, sug_egr_m, buf_egr_m, "Egresos")
             st.download_button("🔻 Descargar EGRESOS (-)", data=buf_egr_m.getvalue(), file_name="Conciliacion_Egresos_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         with c2:
             buf_ing_m = io.BytesIO()
-            generar_excel_plantilla(df_aux[df_aux['Monto_Neto'] > 0], df_ext[df_ext['Monto_Neto'] > 0], buf_ing_m, "Ingresos")
+            df_a_ing = df_aux[df_aux['Monto_Neto'] > 0]
+            df_e_ing = df_ext[df_ext['Monto_Neto'] > 0]
+            sug_ing_m = obtener_sugerencias_cruce(solo_aux[solo_aux['Monto_Neto'] > 0], solo_ext[solo_ext['Monto_Neto'] > 0], tol_monto=tol_pesos)
+            generar_excel_plantilla(df_a_ing, df_e_ing, sug_ing_m, buf_ing_m, "Ingresos")
             st.download_button("🟢 Descargar INGRESOS (+)", data=buf_ing_m.getvalue(), file_name="Conciliacion_Ingresos_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         with c3:
             buf_gen_m = io.BytesIO()
-            generar_excel_plantilla(df_aux, df_ext, buf_gen_m, "General_Consolidado")
+            generar_excel_plantilla(df_aux, df_ext, sug_gen_m, buf_gen_m, "General_Consolidado")
             st.download_button("📦 Descargar GENERAL", data=buf_gen_m.getvalue(), file_name="Conciliacion_General_Mensual.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        if not sug_gen_m.empty:
+            st.markdown("---")
+            st.subheader("💡 Vista Previa: Posibles Sugerencias de Cruce Halladas")
+            st.dataframe(sug_gen_m)
