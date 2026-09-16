@@ -1,14 +1,13 @@
 import io
 import re
-from datetime import datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
 import pandas as pd
-import numpy as np
 import streamlit as st
 
-st.set_page_config(page_title="Sistema de Conciliación & Control Diario/Mensual", layout="wide")
+# Configuración de la página Streamlit
+st.set_page_config(page_title="Sistema de Conciliación Bancaria", layout="wide")
 
 # ==========================================
 # 1. FUNCIONES AUXILIARES DE LIMPIEZA
@@ -26,26 +25,25 @@ def limpiar_valor(val):
     except:
         return 0.0
 
-def normalizar_fecha_ddmmyyyy(val, year_base=2026):
+def formatear_fecha_original(val):
+    """
+    Conserva la fecha exacta del archivo original.
+    Transforma formatos nativos o texto a DD/MM/YYYY sin alterar el valor real.
+    """
     if pd.isna(val) or str(val).strip() == '':
-        return "01/01/2026"
-    val_s = str(val).strip().split(' ')[0].replace('-', '/')
-    parts = val_s.split('/')
-    if len(parts) == 2:
-        try:
-            d, m = int(parts[0]), int(parts[1])
-            return f"{d:02d}/{m:02d}/{year_base}"
-        except:
-            return "01/01/2026"
-    elif len(parts) >= 3:
-        try:
-            d, m, y = int(parts[0]), int(parts[1]), str(parts[2])
-            if len(y) == 2:
-                y = f"20{y}"
-            return f"{d:02d}/{m:02d}/{y}"
-        except:
-            return "01/01/2026"
-    return "01/01/2026"
+        return ""
+    
+    val_str = str(val).strip().split(' ')[0].replace('-', '/')
+    
+    # Manejo de timestamps/objetos date de pandas
+    try:
+        dt = pd.to_datetime(val_str, dayfirst=True, errors='coerce')
+        if pd.notna(dt):
+            return dt.strftime('%d/%m/%Y')
+    except:
+        pass
+        
+    return val_str
 
 # ==========================================
 # 2. ALGORITMO DE SUGERENCIAS INTELIGENTES
@@ -57,12 +55,6 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
 
     aux_tmp = df_aux_pend.copy()
     ext_tmp = df_ext_pend.copy()
-    
-    # Asegurar existencia de Fecha_Clean
-    if 'Fecha_Clean' not in aux_tmp.columns:
-        aux_tmp['Fecha_Clean'] = "01/01/2026"
-    if 'Fecha_Clean' not in ext_tmp.columns:
-        ext_tmp['Fecha_Clean'] = "01/01/2026"
 
     aux_tmp['Fecha_dt'] = pd.to_datetime(aux_tmp['Fecha_Clean'], format='%d/%m/%Y', errors='coerce')
     ext_tmp['Fecha_dt'] = pd.to_datetime(ext_tmp['Fecha_Clean'], format='%d/%m/%Y', errors='coerce')
@@ -86,7 +78,6 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
             if diff_monto <= tol_monto:
                 dias_desfase = abs((fecha_e - fecha_a).days) if (pd.notna(fecha_a) and pd.notna(fecha_e)) else 0
                 
-                # Coincidencia si están dentro del mismo mes o desfase menor a 15 días
                 candidatos.append({
                     'idx_e': idx_e,
                     'Fecha_Banco': row_e['Fecha_Clean'],
@@ -119,7 +110,72 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
     return pd.DataFrame(sugerencias)
 
 # ==========================================
-# 3. GENERADOR DE LIBRO EXCEL (6 HOJAS)
+# 3. PARSERS INDEPENDIENTES Y SEGUROS
+# ==========================================
+def procesar_auxiliar(df_raw):
+    """Procesa el Auxiliar Contable estándar."""
+    df = df_raw.copy()
+    if len(df) > 7 and 'Código contable' in str(df.iloc[6].values):
+        headers = df.iloc[6].values
+        df = df.iloc[8:].copy()
+        df.columns = headers
+
+    df = df.dropna(how='all')
+    
+    col_deb = next((c for c in df.columns if 'Débito' in str(c) or 'Debito' in str(c)), None)
+    col_cred = next((c for c in df.columns if 'Crédito' in str(c) or 'Credito' in str(c)), None)
+    col_fec = next((c for c in df.columns if 'Fecha' in str(c)), None)
+
+    df['Débito_Clean'] = df[col_deb].apply(limpiar_valor) if col_deb else 0.0
+    df['Crédito_Clean'] = df[col_cred].apply(limpiar_valor) if col_cred else 0.0
+    df['Monto_Neto'] = df['Débito_Clean'] - df['Crédito_Clean']
+
+    df['Fecha_Clean'] = df[col_fec].apply(formatear_fecha_original) if col_fec else ""
+    return df
+
+def procesar_diario_csv(df_raw):
+    """Procesa el CSV de movimiento diario garantizando la lectura de fecha original."""
+    df = df_raw.copy()
+    
+    # Mapeo por posición fija de columnas del CSV diario
+    if df.shape[1] >= 8:
+        df_proc = df.iloc[:, [2, 3, 5, 7]].copy()
+        df_proc.columns = ['Fecha_Int', 'Valor_Raw', 'Codigo_Tx', 'Descripcion']
+    else:
+        df_proc = df.copy()
+        df_proc.columns = [f'Col_{i}' for i in range(df_proc.shape[1])]
+        df_proc['Fecha_Int'] = df_proc.iloc[:, 0]
+        df_proc['Valor_Raw'] = df_proc.iloc[:, 1] if df_proc.shape[1] > 1 else 0
+        df_proc['Descripcion'] = df_proc.iloc[:, -1]
+
+    df_proc['Monto_Neto'] = df_proc['Valor_Raw'].apply(limpiar_valor)
+    df_proc['Fecha_Clean'] = df_proc['Fecha_Int'].apply(formatear_fecha_original)
+    return df_proc
+
+def procesar_extracto_mensual_excel(df_raw):
+    """Procesa el Excel mensual de extracto omitiendo encabezados de manera segura."""
+    df = df_raw.copy()
+    
+    # Filtrar solo filas donde la primera columna parece una fecha válida (DD/MM o YYYY)
+    mask = df.iloc[:, 0].astype(str).str.contains(r'\d{1,2}[/-]\d{1,2}', regex=True, na=False)
+    df_clean = df[mask].copy()
+    
+    if df_clean.empty:
+        df_clean = df.dropna(how='all').iloc[8:].copy() # Fallback por índice si no coincide patrón
+
+    df_clean = df_clean.iloc[:, :6]
+    cols_base = ['FECHA', 'DESCRIPCIÓN', 'SUCURSAL', 'DCTO', 'VALOR', 'SALDO']
+    df_clean.columns = cols_base[:df_clean.shape[1]]
+
+    col_val = 'VALOR' if 'VALOR' in df_clean.columns else df_clean.columns[-2]
+    col_fec = 'FECHA' if 'FECHA' in df_clean.columns else df_clean.columns[0]
+
+    df_clean['Monto_Neto'] = df_clean[col_val].apply(limpiar_valor)
+    df_clean['Fecha_Clean'] = df_clean[col_fec].apply(formatear_fecha_original)
+    return df_clean
+
+# ==========================================
+# 4. GENERADOR DE LIBRO EXCEL (6 HOJAS)
 # ==========================================
 def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, tipo_reporte="General"):
     wb = openpyxl.Workbook()
@@ -147,12 +203,6 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     ws_resumen['A2'].font = font_title
     ws_resumen['B2'] = tipo_reporte
     ws_resumen['B2'].font = font_bold
-
-    ws_resumen['A4'], ws_resumen['B4'] = "Fecha / Período:", 2026
-    ws_resumen['A4'].font = font_bold
-
-    ws_resumen['A5'], ws_resumen['B5'], ws_resumen['C5'] = "Cuenta Bancaria:", "Banco Principal", "Cta. Ahorros / Corriente"
-    ws_resumen['A5'].font = font_bold
 
     headers_res = ["CONCEPTO", "VALOR (COP / USD)", "NOTAS / AUDITORÍA"]
     for col_idx, text in enumerate(headers_res, 1):
@@ -198,18 +248,12 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
 
     for idx, row in df_aux_proc.reset_index(drop=True).iterrows():
         r = idx + 2
-        fecha_val = row.get('Fecha_Clean', '')
-        doc_val = row.get('Comprobante', '')
-        concepto_val = row.get('Concepto', row.get('Código contable', ''))
-        nombre_val = row.get('Nombre del tercero', '')
-        monto_val = float(row.get('Monto_Neto', 0))
-
         ws_aux.append([
-            str(fecha_val),
-            str(doc_val),
-            str(concepto_val),
-            str(nombre_val),
-            monto_val,
+            str(row.get('Fecha_Clean', '')),
+            str(row.get('Comprobante', '')),
+            str(row.get('Concepto', row.get('Código contable', ''))),
+            str(row.get('Nombre del tercero', '')),
+            float(row.get('Monto_Neto', 0)),
             f'=CONCATENATE(A{r},E{r},"-",COUNTIFS($A$2:A{r},A{r},$E$2:E{r},E{r}))',
             f'=IF(ISNUMBER(MATCH(F{r}, \'EXTRACTO\'!$D:$D, 0)), "CONCILIADO", "NO ESTA EN BANCOS")'
         ])
@@ -226,14 +270,10 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
 
     for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
         r = idx + 2
-        fecha_val = row.get('Fecha_Clean', '')
-        ref_val = row.get('Descripcion', row.get('DESCRIPCIÓN', ''))
-        monto_val = float(row.get('Monto_Neto', 0))
-
         ws_ext.append([
-            str(fecha_val),
-            str(ref_val),
-            monto_val,
+            str(row.get('Fecha_Clean', '')),
+            str(row.get('Descripcion', row.get('DESCRIPCIÓN', ''))),
+            float(row.get('Monto_Neto', 0)),
             f'=CONCATENATE(A{r},C{r},"-",COUNTIFS($A$2:A{r},A{r},$C$2:C{r},C{r}))',
             f'=IF(ISNUMBER(MATCH(D{r}, \'AUXILIAR\'!$F:$F, 0)), "CONCILIADO", "Pen Contabilidad")'
         ])
@@ -278,9 +318,7 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
         ref_val = str(row.get('Descripcion', row.get('DESCRIPCIÓN', '')))
         if ref_val not in refs_sugeridas:
-            fecha_val = str(row.get('Fecha_Clean', ''))
-            monto_val = float(row.get('Monto_Neto', 0))
-            ws_pend.append([fecha_val, ref_val, monto_val, "Pen Contabilidad"])
+            ws_pend.append([str(row.get('Fecha_Clean', '')), ref_val, float(row.get('Monto_Neto', 0)), "Pen Contabilidad"])
 
     max_pend_tbl = max(ws_pend.max_row, 2)
     tab5 = Table(displayName="TablaPendientes", ref=f"A1:D{max_pend_tbl}")
@@ -298,9 +336,8 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
         ref_val = str(row.get('Descripcion', row.get('DESCRIPCIÓN', '')))
         if re.search(patron_gastos, ref_val, re.IGNORECASE):
-            fecha_val = str(row.get('Fecha_Clean', ''))
             monto_val = float(row.get('Monto_Neto', 0))
-            ws_gastos.append([fecha_val, ref_val, monto_val, "Gasto / Impuesto Financiero"])
+            ws_gastos.append([str(row.get('Fecha_Clean', '')), ref_val, monto_val, "Gasto / Impuesto Financiero"])
             total_gastos += monto_val
 
     r_total = ws_gastos.max_row + 1
@@ -320,79 +357,6 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     ws_gastos.add_table(tab6)
 
     wb.save(buffer)
-
-# ==========================================
-# 4. PARSERS ROBUSTOS CON FALLBACK
-# ==========================================
-def procesar_auxiliar(df_raw):
-    try:
-        headers = df_raw.iloc[6].values
-        df = df_raw.iloc[8:].copy()
-        df.columns = headers
-    except:
-        df = df_raw.copy()
-
-    df = df.dropna(how='all')
-    
-    col_deb = next((c for c in df.columns if 'Débito' in str(c) or 'Debito' in str(c)), None)
-    col_cred = next((c for c in df.columns if 'Crédito' in str(c) or 'Credito' in str(c)), None)
-    col_fec = next((c for c in df.columns if 'Fecha' in str(c)), None)
-
-    df['Débito_Clean'] = df[col_deb].apply(limpiar_valor) if col_deb else 0.0
-    df['Crédito_Clean'] = df[col_cred].apply(limpiar_valor) if col_cred else 0.0
-    df['Monto_Neto'] = df['Débito_Clean'] - df['Crédito_Clean']
-
-    if col_fec:
-        df['Fecha_Clean'] = df[col_fec].apply(lambda x: normalizar_fecha_ddmmyyyy(x))
-    else:
-        df['Fecha_Clean'] = "01/01/2026"
-        
-    return df
-
-def procesar_diario_csv(df_raw):
-    df = df_raw.copy()
-    if df.shape[1] >= 6:
-        df = df.iloc[:, [0, 1, 3, 5, 6, 7] if df.shape[1] >= 8 else range(df.shape[1])].copy()
-        df.columns = ['Cuenta', 'Oficina', 'Fecha_Int', 'Valor_Raw', 'Codigo_Tx', 'Descripcion'][:df.shape[1]]
-    
-    col_val = 'Valor_Raw' if 'Valor_Raw' in df.columns else df.columns[-2]
-    col_fec = 'Fecha_Int' if 'Fecha_Int' in df.columns else df.columns[0]
-    
-    df['Monto_Neto'] = df[col_val].apply(limpiar_valor)
-    df['Fecha_Clean'] = df[col_fec].apply(lambda x: normalizar_fecha_ddmmyyyy(x))
-    return df
-
-def procesar_extracto_mensual_excel(df_raw):
-    """
-    Parser robusto: extrae únicamente filas numéricas y de texto con contenido
-    evitando que se pierda la columna 'Fecha_Clean'.
-    """
-    df = df_raw.copy()
-    
-    # Buscar dinámicamente la fila donde empiezan los datos de fecha
-    idx_inicio = 0
-    for i in range(min(15, len(df))):
-        row_str = " ".join(df.iloc[i].astype(str).values)
-        if re.search(r'\d{1,2}[/-]\d{1,2}', row_str):
-            idx_inicio = i
-            break
-            
-    df_data = df.iloc[idx_inicio:].dropna(how='all').copy()
-    df_data = df_data.iloc[:, :6]
-    
-    # Renombrar estandarizadamente
-    cols = ['FECHA', 'DESCRIPCIÓN', 'SUCURSAL', 'DCTO', 'VALOR', 'SALDO']
-    df_data.columns = cols[:df_data.shape[1]]
-    
-    # Garantizar columna Monto_Neto
-    col_val = 'VALOR' if 'VALOR' in df_data.columns else df_data.columns[-1]
-    df_data['Monto_Neto'] = df_data[col_val].apply(limpiar_valor)
-    
-    # Garantizar columna Fecha_Clean SIEMPRE
-    col_fec = 'FECHA' if 'FECHA' in df_data.columns else df_data.columns[0]
-    df_data['Fecha_Clean'] = df_data[col_fec].apply(lambda x: normalizar_fecha_ddmmyyyy(x))
-    
-    return df_data
 
 # ==========================================
 # 5. INTERFAZ STREAMLIT
@@ -426,7 +390,6 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
         df_diario = procesar_diario_csv(df_diario_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        # Sugerencias directo sin bloqueo rígido de llave de fecha exacta
         sug_gen = obtener_sugerencias_cruce(df_aux, df_diario, tol_monto=tol_pesos)
 
         st.success(f"✅ Análisis completado. Se hallaron {len(sug_gen)} posibles coincidencias.")
@@ -479,7 +442,6 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
         df_ext = procesar_extracto_mensual_excel(df_ext_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        # Algoritmo de Sugerencias seguro
         sug_gen_m = obtener_sugerencias_cruce(df_aux, df_ext, tol_monto=tol_pesos)
 
         st.success(f"✅ Conciliación realizada. Se detectaron {len(sug_gen_m)} sugerencias de cruce.")
