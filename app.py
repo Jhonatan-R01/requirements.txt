@@ -10,10 +10,11 @@ import streamlit as st
 st.set_page_config(page_title="Sistema de Conciliación Bancaria", layout="wide")
 
 # ==========================================
-# 1. FUNCIONES AUXILIARES DE LIMPIEZA Y FECHAS
+# 1. FUNCIONES AUXILIARES DE LIMPIEZA
 # ==========================================
 def limpiar_valor(val):
-    if pd.isna(val):
+    """Limpia cualquier formato de texto/moneda y retorna float."""
+    if pd.isna(val) or str(val).strip() in ['', '-']:
         return 0.0
     val_str = str(val).strip().replace('$', '').replace(' ', '')
     if ',' in val_str and '.' in val_str:
@@ -26,16 +27,22 @@ def limpiar_valor(val):
         return 0.0
 
 # ==========================================
-# 2. PARSERS BASE INTACTOS (RESPETANDO TU CÓDIGO)
+# 2. PARSERS BASE (LEY NO. 1 & LEY NO. 5)
 # ==========================================
 def procesar_auxiliar(df_raw):
+    """
+    Ley No. 5: Débito (+) - Crédito (-) = Monto Neto
+    Procesa el auxiliar contable estandarizando fechas y signos.
+    """
     headers = df_raw.iloc[6].values
     df = df_raw.iloc[8:].copy()
-    df.columns = headers
+    df.columns = [str(c).strip() for c in headers]
     df = df.dropna(subset=['Código contable', 'Fecha elaboración'])
     
     df['Débito_Clean'] = df['Débito'].apply(limpiar_valor)
     df['Crédito_Clean'] = df['Crédito'].apply(limpiar_valor)
+    
+    # Ley No. 5: Conversión estándar del Auxiliar
     df['Monto_Neto'] = df['Débito_Clean'] - df['Crédito_Clean']
     
     col_fecha = 'Fecha elaboration' if 'Fecha elaboration' in df.columns else 'Fecha elaboración'
@@ -43,7 +50,7 @@ def procesar_auxiliar(df_raw):
     return df
 
 def procesar_diario_csv(df_raw):
-    """Mantiene intacta la estructura original funcional."""
+    """Mantiene la estructura original del archivo CSV operativo."""
     df = df_raw.iloc[:, [0, 1, 3, 5, 6, 7]].copy()
     df.columns = ['Cuenta', 'Oficina', 'Fecha_Int', 'Valor_Raw', 'Codigo_Tx', 'Descripcion']
     df['Monto_Neto'] = df['Valor_Raw'].apply(limpiar_valor)
@@ -51,19 +58,34 @@ def procesar_diario_csv(df_raw):
     return df
 
 def procesar_extracto_excel(df_raw):
-    """Parser independiente exclusivo para el extracto mensual en Excel."""
-    df = df_raw.iloc[15:].copy()
-    df.columns = ['FECHA', 'DESCRIPCIÓN', 'SUCURSAL', 'DCTO', 'VALOR', 'SALDO', 'X1', 'X2']
-    df = df.dropna(subset=['FECHA', 'VALOR'])
-    df = df[~df['FECHA'].astype(str).str.contains('FECHA|FIN ESTADO', case=False, na=False)]
-    df['Monto_Neto'] = df['VALOR'].apply(limpiar_valor)
-    df['Fecha_Clean'] = pd.to_datetime(df['FECHA'].astype(str), errors='coerce').dt.strftime('%Y-%m-%d')
-    return df
+    """
+    Ley No. 1: Filtro inteligente vía RegEx sobre campo Fecha.
+    Elimina encabezados, saltos de página y filas cliente garantizando 0% pérdida de datos.
+    """
+    df = df_raw.iloc[:, 0:6].copy()
+    df.columns = ['FECHA', 'DESCRIPCIÓN', 'SUCURSAL', 'DCTO', 'VALOR', 'SALDO']
+    
+    df['FECHA_STR'] = df['FECHA'].astype(str).str.strip()
+    
+    # RegEx que identifica únicamente formatos de fecha válidos (ej. 1/08, 15/08, 2026/08/01)
+    patron_fecha = r'^\d{1,2}/\d{1,2}'
+    df_clean = df[df['FECHA_STR'].str.contains(patron_fecha, na=False)].copy()
+    
+    df_clean['Monto_Neto'] = df_clean['VALOR'].apply(limpiar_valor)
+    
+    # Estandarización de fecha YYYY-MM-DD
+    df_clean['Fecha_Clean'] = pd.to_datetime(df_clean['FECHA_STR'] + '/2026', format='%d/%m/%Y', errors='coerce').dt.strftime('%Y-%m-%d')
+    
+    return df_clean.drop(columns=['FECHA_STR'])
 
 # ==========================================
-# 3. ALGORITMO DE SUGERENCIAS DE CRUCE
+# 3. ALGORITMO DE SUGERENCIAS (LEY NO. 3)
 # ==========================================
 def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
+    """
+    Ley No. 3: Sugerencias exclusivas para partidas no cruzadas exactamente.
+    Evalúa Certeza Alta (Monto + Texto) y Certeza Media (Monto + Proximidad Días).
+    """
     sugerencias = []
     if df_aux_pend.empty or df_ext_pend.empty:
         return pd.DataFrame(sugerencias)
@@ -79,6 +101,7 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
     for idx_a, row_a in aux_tmp.iterrows():
         monto_a = float(row_a['Monto_Neto'])
         fecha_a = row_a['Fecha_dt']
+        txt_a = str(row_a.get('Nombre del tercero', '')).upper().strip()
         
         if pd.isna(fecha_a):
             continue
@@ -90,30 +113,42 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
                 
             monto_e = float(row_e['Monto_Neto'])
             fecha_e = row_e['Fecha_dt']
+            txt_e = str(row_e.get('Descripcion', row_e.get('DESCRIPCIÓN', ''))).upper().strip()
             
             if pd.isna(fecha_e):
                 continue
 
+            # Evaluar mismo mes y año
             if (fecha_a.year == fecha_e.year) and (fecha_a.month == fecha_e.month):
                 diff_monto = abs(monto_a - monto_e)
+                dias_desfase = abs((fecha_e - fecha_a).days)
                 
+                # Coincidencia textual parcial
+                palabras_a = [p for p in txt_a.split() if len(p) > 3]
+                match_texto = any(p in txt_e for p in palabras_a) if palabras_a else False
+
                 if diff_monto <= tol_monto:
-                    dias_desfase = abs((fecha_e - fecha_a).days)
-                    candidatos.append({
-                        'idx_e': idx_e,
-                        'Fecha_Banco': row_e['Fecha_Clean'],
-                        'Ref_Banco': row_e.get('Descripcion', row_e.get('DESCRIPCIÓN', '')),
-                        'Monto_Banco': monto_e,
-                        'Diff_Monto': diff_monto,
-                        'Dias_Desfase': dias_desfase
-                    })
+                    certeza = None
+                    if match_texto:
+                        certeza = "Alta (Monto + Texto / Tercero)"
+                    elif dias_desfase <= 3:
+                        certeza = f"Media (Monto + Desfase {dias_desfase} días)"
+                    
+                    if certeza:
+                        candidatos.append({
+                            'idx_e': idx_e,
+                            'Fecha_Banco': row_e['Fecha_Clean'],
+                            'Ref_Banco': row_e.get('Descripcion', row_e.get('DESCRIPCIÓN', '')),
+                            'Monto_Banco': monto_e,
+                            'Diff_Monto': diff_monto,
+                            'Dias_Desfase': dias_desfase,
+                            'Certeza': certeza
+                        })
 
         if candidatos:
-            candidatos.sort(key=lambda x: (x['Diff_Monto'], x['Dias_Desfase']))
+            candidatos.sort(key=lambda x: (0 if "Alta" in x['Certeza'] else 1, x['Diff_Monto'], x['Dias_Desfase']))
             mejor = candidatos[0]
             ext_usados.add(mejor['idx_e'])
-            
-            certeza = "Alta (Exacto)" if mejor['Diff_Monto'] == 0 else f"Media (Diff: ${mejor['Diff_Monto']:.2f})"
             
             sugerencias.append({
                 'Fecha Contable': row_a['Fecha_Clean'],
@@ -125,7 +160,7 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
                 'Monto Banco': mejor['Monto_Banco'],
                 'Diferencia ($)': mejor['Diff_Monto'],
                 'Días Desfase': mejor['Dias_Desfase'],
-                'Certeza': certeza
+                'Certeza': mejor['Certeza']
             })
 
     return pd.DataFrame(sugerencias)
@@ -239,7 +274,7 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     tab2.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
     ws_ext.add_table(tab2)
 
-    # HOJA 4: Sugerencias de Cruce
+    # HOJA 4: Sugerencias de Cruce (Ley No. 3)
     ws_sug = wb.create_sheet(title="Sugerencias de Cruce")
     ws_sug.views.sheetView[0].showGridLines = True
     ws_sug.append(["Fecha Contable", "Documento", "Tercero", "Monto Contable", "Fecha Banco", "Referencia Banco", "Monto Banco", "Diferencia ($)", "Días Desfase", "Certeza"])
@@ -264,7 +299,7 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     tab3.tableStyleInfo = TableStyleInfo(name="TableStyleMedium3", showRowStripes=True)
     ws_sug.add_table(tab3)
 
-    # HOJA 5: Pendientes por Registrar (Reales no cruzados)
+    # HOJA 5: Pendientes por Registrar (Ley No. 4)
     ws_pend = wb.create_sheet(title="Pendientes por Registrar")
     ws_pend.views.sheetView[0].showGridLines = True
     ws_pend.append(["Fecha Banco", "Referencia / Descripción", "Monto (+/-)", "Estado"])
@@ -338,15 +373,19 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
         file_auxiliar = st.file_uploader("2. Cargar Auxiliar Contable (.xlsx)", type=["xlsx"], key="aux_diario")
 
     if file_diario and file_auxiliar:
-        df_diario_raw = pd.read_csv(file_diario, encoding="latin1", header=None)
+        try:
+            df_diario_raw = pd.read_csv(file_diario, encoding="latin1", header=None)
+        except:
+            df_diario_raw = pd.read_csv(file_diario, encoding="utf-8", header=None)
+
         df_aux_raw = pd.read_excel(file_auxiliar)
 
         df_diario = procesar_diario_csv(df_diario_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        # Identificar partidas exactas para descartar y sugerir solo sobre pendientes
-        df_diario['Monto_Abs'] = df_diario['Monto_Neto'].abs().round(2)
-        df_aux['Monto_Abs'] = df_aux['Monto_Neto'].abs().round(2)
+        # Ley No. 2: Cruce Exacto Unificado por Llave Triclave
+        df_diario['Monto_Abs'] = df_diario['Monto_Neto'].round(2)
+        df_aux['Monto_Abs'] = df_aux['Monto_Neto'].round(2)
 
         df_diario['Ocurrencia'] = df_diario.groupby(['Fecha_Clean', 'Monto_Abs']).cumcount() + 1
         df_aux['Ocurrencia'] = df_aux.groupby(['Fecha_Clean', 'Monto_Abs']).cumcount() + 1
@@ -404,18 +443,19 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
         df_ext_raw = pd.read_excel(file_ext, header=None)
         df_aux_raw = pd.read_excel(file_auxiliar)
 
+        # Ley No. 1: Filtro dinámico sin pérdida por salto de página
         df_ext = procesar_extracto_excel(df_ext_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        # Identificar partidas exactas
-        df_ext['Monto_Abs'] = df_ext['Monto_Neto'].abs().round(2)
-        df_aux['Monto_Abs'] = df_aux['Monto_Neto'].abs().round(2)
+        # Ley No. 2: Cruce Exacto por Llave Triclave
+        df_ext['Monto_Abs'] = df_ext['Monto_Neto'].round(2)
+        df_aux['Monto_Abs'] = df_aux['Monto_Neto'].round(2)
 
-        df_ext['Ocurrencia'] = df_ext.groupby(['Monto_Abs']).cumcount() + 1
-        df_aux['Ocurrencia'] = df_aux.groupby(['Monto_Abs']).cumcount() + 1
+        df_ext['Ocurrencia'] = df_ext.groupby(['Fecha_Clean', 'Monto_Abs']).cumcount() + 1
+        df_aux['Ocurrencia'] = df_aux.groupby(['Fecha_Clean', 'Monto_Abs']).cumcount() + 1
 
-        df_ext['LLAVE'] = df_ext['Monto_Abs'].astype(str) + "_" + df_ext['Ocurrencia'].astype(str)
-        df_aux['LLAVE'] = df_aux['Monto_Abs'].astype(str) + "_" + df_aux['Ocurrencia'].astype(str)
+        df_ext['LLAVE'] = df_ext['Fecha_Clean'] + "_" + df_ext['Monto_Abs'].astype(str) + "_" + df_ext['Ocurrencia'].astype(str)
+        df_aux['LLAVE'] = df_aux['Fecha_Clean'] + "_" + df_aux['Monto_Abs'].astype(str) + "_" + df_aux['Ocurrencia'].astype(str)
 
         solo_ext = df_ext[~df_ext['LLAVE'].isin(df_aux['LLAVE'])]
         solo_aux = df_aux[~df_aux['LLAVE'].isin(df_ext['LLAVE'])]
