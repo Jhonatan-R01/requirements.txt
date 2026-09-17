@@ -6,14 +6,12 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 import pandas as pd
 import streamlit as st
 
-# Configuración de la página Streamlit
 st.set_page_config(page_title="Sistema de Conciliación Bancaria", layout="wide")
 
 # ==========================================
 # 1. FUNCIONES AUXILIARES DE LIMPIEZA
 # ==========================================
 def limpiar_valor(val):
-    """Limpia cualquier formato de texto/moneda y retorna float."""
     if pd.isna(val) or str(val).strip() in ['', '-']:
         return 0.0
     val_str = str(val).strip().replace('$', '').replace(' ', '')
@@ -27,13 +25,9 @@ def limpiar_valor(val):
         return 0.0
 
 # ==========================================
-# 2. PARSERS BASE (LEY NO. 1 & LEY NO. 5)
+# 2. PARSERS BASE Y TRANSFORMACIÓN DE SIGNOS
 # ==========================================
 def procesar_auxiliar(df_raw):
-    """
-    Ley No. 5: Débito (+) - Crédito (-) = Monto Neto
-    Procesa el auxiliar contable estandarizando fechas y signos.
-    """
     headers = df_raw.iloc[6].values
     df = df_raw.iloc[8:].copy()
     df.columns = [str(c).strip() for c in headers]
@@ -42,7 +36,7 @@ def procesar_auxiliar(df_raw):
     df['Débito_Clean'] = df['Débito'].apply(limpiar_valor)
     df['Crédito_Clean'] = df['Crédito'].apply(limpiar_valor)
     
-    # Ley No. 5: Conversión estándar del Auxiliar
+    # Conversión garantizada: Crédito (positivo en origen) pasa a Egreso (-)
     df['Monto_Neto'] = df['Débito_Clean'] - df['Crédito_Clean']
     
     col_fecha = 'Fecha elaboration' if 'Fecha elaboration' in df.columns else 'Fecha elaboración'
@@ -50,7 +44,6 @@ def procesar_auxiliar(df_raw):
     return df
 
 def procesar_diario_csv(df_raw):
-    """Mantiene la estructura original del archivo CSV operativo."""
     df = df_raw.iloc[:, [0, 1, 3, 5, 6, 7]].copy()
     df.columns = ['Cuenta', 'Oficina', 'Fecha_Int', 'Valor_Raw', 'Codigo_Tx', 'Descripcion']
     df['Monto_Neto'] = df['Valor_Raw'].apply(limpiar_valor)
@@ -58,34 +51,22 @@ def procesar_diario_csv(df_raw):
     return df
 
 def procesar_extracto_excel(df_raw):
-    """
-    Ley No. 1: Filtro inteligente vía RegEx sobre campo Fecha.
-    Elimina encabezados, saltos de página y filas cliente garantizando 0% pérdida de datos.
-    """
     df = df_raw.iloc[:, 0:6].copy()
     df.columns = ['FECHA', 'DESCRIPCIÓN', 'SUCURSAL', 'DCTO', 'VALOR', 'SALDO']
     
     df['FECHA_STR'] = df['FECHA'].astype(str).str.strip()
-    
-    # RegEx que identifica únicamente formatos de fecha válidos (ej. 1/08, 15/08, 2026/08/01)
     patron_fecha = r'^\d{1,2}/\d{1,2}'
     df_clean = df[df['FECHA_STR'].str.contains(patron_fecha, na=False)].copy()
     
     df_clean['Monto_Neto'] = df_clean['VALOR'].apply(limpiar_valor)
-    
-    # Estandarización de fecha YYYY-MM-DD
     df_clean['Fecha_Clean'] = pd.to_datetime(df_clean['FECHA_STR'] + '/2026', format='%d/%m/%Y', errors='coerce').dt.strftime('%Y-%m-%d')
     
     return df_clean.drop(columns=['FECHA_STR'])
 
 # ==========================================
-# 3. ALGORITMO DE SUGERENCIAS (LEY NO. 3)
+# 3. ALGORITMO DE SUGERENCIAS CON CONTROL DE SIGNO
 # ==========================================
 def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
-    """
-    Ley No. 3: Sugerencias exclusivas para partidas no cruzadas exactamente.
-    Evalúa Certeza Alta (Monto + Texto) y Certeza Media (Monto + Proximidad Días).
-    """
     sugerencias = []
     if df_aux_pend.empty or df_ext_pend.empty:
         return pd.DataFrame(sugerencias)
@@ -118,12 +99,13 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
             if pd.isna(fecha_e):
                 continue
 
-            # Evaluar mismo mes y año
-            if (fecha_a.year == fecha_e.year) and (fecha_a.month == fecha_e.month):
-                diff_monto = abs(monto_a - monto_e)
+            # CONTROL DE SIGNO ESTRICTO: Compara únicamente (+ con +) o (- con -)
+            mismo_sentido = (monto_a > 0 and monto_e > 0) or (monto_a < 0 and monto_e < 0)
+
+            if mismo_sentido and (fecha_a.year == fecha_e.year) and (fecha_a.month == fecha_e.month):
+                diff_monto = abs(abs(monto_a) - abs(monto_e))
                 dias_desfase = abs((fecha_e - fecha_a).days)
                 
-                # Coincidencia textual parcial
                 palabras_a = [p for p in txt_a.split() if len(p) > 3]
                 match_texto = any(p in txt_e for p in palabras_a) if palabras_a else False
 
@@ -166,7 +148,7 @@ def obtener_sugerencias_cruce(df_aux_pend, df_ext_pend, tol_monto=10.0):
     return pd.DataFrame(sugerencias)
 
 # ==========================================
-# 4. GENERADOR EXCEL MULTI-HOJA (6 HOJAS)
+# 4. GENERADOR EXCEL MULTI-HOJA CON DEPURACIÓN TRIPLE
 # ==========================================
 def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, tipo_reporte="General"):
     wb = openpyxl.Workbook()
@@ -245,7 +227,7 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
             str(row.get('Concepto', row.get('Código contable', ''))),
             str(row.get('Nombre del tercero', '')),
             float(row.get('Monto_Neto', 0)),
-            f'=CONCATENATE(A{r},E{r},"-",COUNTIFS($A$2:A{r},A{r},$E$2:E{r},E{r}))',
+            f'=CONCATENATE(A{r}, "-", E{r}, "-", COUNTIFS($A$2:A{r}, A{r}, $E$2:E{r}, E{r}))',
             f'=IF(ISNUMBER(MATCH(F{r}, \'Extracto Bancario\'!$D:$D, 0)), "CONCILIADO", "NO ESTA EN BANCOS")'
         ])
 
@@ -265,7 +247,7 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
             str(row.get('Fecha_Clean', '')),
             str(row.get('Descripcion', row.get('DESCRIPCIÓN', ''))),
             float(row.get('Monto_Neto', 0)),
-            f'=CONCATENATE(A{r},C{r},"-",COUNTIFS($A$2:A{r},A{r},$C$2:C{r},C{r}))',
+            f'=CONCATENATE(A{r}, "-", C{r}, "-", COUNTIFS($A$2:A{r}, A{r}, $C$2:C{r}, C{r}))',
             f'=IF(ISNUMBER(MATCH(D{r}, \'Auxiliar Contable\'!$F:$F, 0)), "CONCILIADO", "Pen Contabilidad")'
         ])
 
@@ -274,7 +256,7 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     tab2.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
     ws_ext.add_table(tab2)
 
-    # HOJA 4: Sugerencias de Cruce (Ley No. 3)
+    # HOJA 4: Sugerencias de Cruce
     ws_sug = wb.create_sheet(title="Sugerencias de Cruce")
     ws_sug.views.sheetView[0].showGridLines = True
     ws_sug.append(["Fecha Contable", "Documento", "Tercero", "Monto Contable", "Fecha Banco", "Referencia Banco", "Monto Banco", "Diferencia ($)", "Días Desfase", "Certeza"])
@@ -299,16 +281,25 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     tab3.tableStyleInfo = TableStyleInfo(name="TableStyleMedium3", showRowStripes=True)
     ws_sug.add_table(tab3)
 
-    # HOJA 5: Pendientes por Registrar (Ley No. 4)
+    # IDENTIFICACIÓN PREVIA DE EXCLUSIONES PARA HOJA PENDIENTES
+    patron_gastos = r'IMPTO GOBIERNO|4X1000|COMISION|IVA COMISION|INTERESES|CUOTA MANEJO|MANTE SUCURSAL'
+    gastos_refs_set = set()
+
+    for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
+        ref_val = str(row.get('Descripcion', row.get('DESCRIPCIÓN', '')))
+        if re.search(patron_gastos, ref_val, re.IGNORECASE):
+            gastos_refs_set.add(ref_val)
+
+    refs_sugeridas = set(df_sugerencias['Referencia Banco'].dropna().unique()) if (not df_sugerencias.empty and 'Referencia Banco' in df_sugerencias.columns) else set()
+
+    # HOJA 5: Pendientes por Registrar (Filtro Inteligente: Sin Sugerencias y Sin Gastos)
     ws_pend = wb.create_sheet(title="Pendientes por Registrar")
     ws_pend.views.sheetView[0].showGridLines = True
     ws_pend.append(["Fecha Banco", "Referencia / Descripción", "Monto (+/-)", "Estado"])
 
-    refs_sugeridas = set(df_sugerencias['Referencia Banco'].dropna().unique()) if (not df_sugerencias.empty and 'Referencia Banco' in df_sugerencias.columns) else set()
-
     for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
         ref_val = str(row.get('Descripcion', row.get('DESCRIPCIÓN', '')))
-        if ref_val not in refs_sugeridas:
+        if (ref_val not in refs_sugeridas) and (ref_val not in gastos_refs_set):
             ws_pend.append([str(row.get('Fecha_Clean', '')), ref_val, float(row.get('Monto_Neto', 0)), "Pen Contabilidad"])
 
     max_pend_tbl = max(ws_pend.max_row, 2)
@@ -321,12 +312,10 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     ws_gastos.views.sheetView[0].showGridLines = True
     ws_gastos.append(["Fecha", "Descripción / Concepto Gasto", "Monto Gasto (-)", "Clasificación"])
 
-    patron_gastos = r'IMPTO GOBIERNO|4X1000|COMISION|IVA COMISION|INTERESES|CUOTA MANEJO|MANTE SUCURSAL'
     total_gastos = 0.0
-
     for idx, row in df_ext_proc.reset_index(drop=True).iterrows():
         ref_val = str(row.get('Descripcion', row.get('DESCRIPCIÓN', '')))
-        if re.search(patron_gastos, ref_val, re.IGNORECASE):
+        if ref_val in gastos_refs_set:
             monto_val = float(row.get('Monto_Neto', 0))
             ws_gastos.append([str(row.get('Fecha_Clean', '')), ref_val, monto_val, "Gasto / Impuesto Financiero"])
             total_gastos += monto_val
@@ -350,7 +339,7 @@ def generar_excel_plantilla(df_aux_proc, df_ext_proc, df_sugerencias, buffer, ti
     wb.save(buffer)
 
 # ==========================================
-# 5. INTERFAZ Y NAVEGACIÓN STREAMLIT
+# 5. NAVEGACIÓN Y PANEL STREAMLIT
 # ==========================================
 st.sidebar.title("📌 Menú Principal")
 opcion = st.sidebar.radio(
@@ -362,7 +351,6 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("⚙️ Configuración de Cruce Inteligente")
 tol_pesos = st.sidebar.number_input("Tolerancia máxima en Pesos ($):", min_value=0.0, max_value=500.0, value=10.0, step=0.50)
 
-# MÓDULO 1: CRUCE DIARIO
 if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
     st.title("📖 Cruce Operativo Diario")
 
@@ -370,7 +358,7 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
     with col1:
         file_diario = st.file_uploader("1. Cargar Movimiento Diario (.csv)", type=["csv"], key="diario_csv")
     with col2:
-        file_auxiliar = st.file_uploader("2. Cargar Auxiliar Contable (.xlsx)", type=["xlsx"], key="aux_diario")
+        file_auxiliar = st.file_uploader("2. Cargar Auxiliar Contable (.xlsx)", type=["aux_diario"])
 
     if file_diario and file_auxiliar:
         try:
@@ -383,7 +371,6 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
         df_diario = procesar_diario_csv(df_diario_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        # Ley No. 2: Cruce Exacto Unificado por Llave Triclave
         df_diario['Monto_Abs'] = df_diario['Monto_Neto'].round(2)
         df_aux['Monto_Abs'] = df_aux['Monto_Neto'].round(2)
 
@@ -398,9 +385,9 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
 
         sug_gen = obtener_sugerencias_cruce(solo_aux, solo_diario, tol_monto=tol_pesos)
 
-        st.success(f"✅ Análisis completado. Se hallaron {len(sug_gen)} sugerencias de cruce en partidas pendientes.")
+        st.success(f"✅ Análisis completado. Se hallaron {len(sug_gen)} sugerencias de cruce.")
 
-        st.markdown("### 📥 Generar y Descargar Archivos (6 Hojas)")
+        st.markdown("### 📥 Generar y Descargar Archivos")
         c1, c2, c3 = st.columns(3)
 
         with c1:
@@ -424,12 +411,6 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
             generar_excel_plantilla(df_aux, df_diario, sug_gen, buf_gen, "General_Consolidado")
             st.download_button("📦 Descargar GENERAL", data=buf_gen.getvalue(), file_name="General_Diarios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        if not sug_gen.empty:
-            st.markdown("---")
-            st.subheader("💡 Vista Previa: Posibles Sugerencias de Cruce Halladas")
-            st.dataframe(sug_gen)
-
-# MÓDULO 2: CONCILIACIÓN MENSUAL
 elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
     st.title("📊 Conciliación Bancaria Mensual")
 
@@ -443,11 +424,9 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
         df_ext_raw = pd.read_excel(file_ext, header=None)
         df_aux_raw = pd.read_excel(file_auxiliar)
 
-        # Ley No. 1: Filtro dinámico sin pérdida por salto de página
         df_ext = procesar_extracto_excel(df_ext_raw)
         df_aux = procesar_auxiliar(df_aux_raw)
 
-        # Ley No. 2: Cruce Exacto por Llave Triclave
         df_ext['Monto_Abs'] = df_ext['Monto_Neto'].round(2)
         df_aux['Monto_Abs'] = df_aux['Monto_Neto'].round(2)
 
@@ -464,7 +443,7 @@ elif opcion == "📊 2. Conciliación Bancaria Mensual (Excel vs Auxiliar)":
 
         st.success(f"✅ Conciliación realizada. Se detectaron {len(sug_gen_m)} sugerencias de cruce.")
 
-        st.markdown("### 📥 Generar y Descargar Archivos (6 Hojas)")
+        st.markdown("### 📥 Generar y Descargar Archivos")
         c1, c2, c3 = st.columns(3)
 
         with c1:
