@@ -358,7 +358,8 @@ if opcion == "📖 1. Cruce Diario (CSV vs Auxiliar)":
     with col1:
         file_diario = st.file_uploader("1. Cargar Movimiento Diario (.csv)", type=["csv"], key="diario_csv")
     with col2:
-        file_auxiliar = st.file_uploader("2. Cargar Auxiliar Contable (.xlsx)", type=["aux_diario"])
+        # CORRECCIÓN DE EXTENSIÓN: type=["xlsx"] permite seleccionar directamente tu archivo Excel (.xlsx)
+        file_auxiliar = st.file_uploader("2. Cargar Auxiliar Contable (.xlsx)", type=["xlsx"], key="aux_diario_xlsx")
 
     if file_diario and file_auxiliar:
         try:
